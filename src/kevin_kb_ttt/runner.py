@@ -253,7 +253,12 @@ def _make_failed_eval(format_ok: bool, error_message: str, code_length: int) -> 
     }
 
 
-def _evaluate_generated_response(args: argparse.Namespace, ref_arch_src: str, raw_text: str, genm: object) -> dict:
+def _prepare_generated_attempt(
+    args: argparse.Namespace,
+    raw_text: str,
+    genm: object,
+    seen_kernel_fingerprints: set[str] | None = None,
+) -> tuple[dict, str | None]:
     parsed = parse_structured_response(raw_text)
     kernel = parsed.kernel or ""
     kernel_fp = _kernel_fingerprint(kernel)
@@ -271,19 +276,34 @@ def _evaluate_generated_response(args: argparse.Namespace, ref_arch_src: str, ra
             "duplicate_kernel": False,
             "kernel_fingerprint": kernel_fp,
             "eval": _make_failed_eval(False, "Could not extract valid kernel code block", len(kernel)),
-        }
+        }, None
 
-    if hasattr(args, "_seen_kernel_fingerprints") and kernel_fp in args._seen_kernel_fingerprints:
+    if seen_kernel_fingerprints is not None and kernel_fp in seen_kernel_fingerprints:
         attempt = _make_duplicate_attempt(genm, raw_text, parsed, kernel)
         attempt["kernel_fingerprint"] = kernel_fp
-        return attempt
+        return attempt, None
 
-    eval_result = asyncio.run(
+    attempt = {
+        "generation": asdict(genm),
+        "raw": raw_text,
+        "thought": parsed.thought,
+        "summary": parsed.thought_summary,
+        "kernel": kernel,
+        "static_check_ok": None,
+        "static_warnings": [],
+        "duplicate_kernel": False,
+        "kernel_fingerprint": kernel_fp,
+    }
+    return attempt, kernel
+
+
+async def _evaluate_kernels_batch_async(args: argparse.Namespace, ref_arch_src: str, kernels: list[str]) -> list[dict]:
+    coros = [
         evaluate_kernel_async(
             level=args.level,
             problem_id=args.problem_id,
             ref_arch_src=ref_arch_src,
-            kernel_code=kernel,
+            kernel_code=kernel_code,
             dataset_source=args.dataset_source,
             dataset_name=args.dataset_name,
             device=args.device,
@@ -297,110 +317,38 @@ def _evaluate_generated_response(args: argparse.Namespace, ref_arch_src: str, ra
             modal_gpu=args.modal_gpu,
             modal_timeout_s=args.modal_timeout_s,
         )
-    )
-
-    return {
-        "generation": asdict(genm),
-        "raw": raw_text,
-        "thought": parsed.thought,
-        "summary": parsed.thought_summary,
-        "kernel": kernel,
-        "static_check_ok": None,
-        "static_warnings": [],
-        "duplicate_kernel": False,
-        "kernel_fingerprint": kernel_fp,
-        "eval": eval_result,
-    }
+        for kernel_code in kernels
+    ]
+    return await asyncio.gather(*coros)
 
 
-def _run_beam_trajectory(
+def _evaluate_generated_response(
     args: argparse.Namespace,
-    llm,
     ref_arch_src: str,
-    base_prompt: str,
-    history: list[dict],
-    steps: int,
-    round_idx: int,
-    trajectory_id: int,
-    generation_temperature: float,
-    attempts: list[dict],
+    raw_text: str,
+    genm: object,
+    seen_kernel_fingerprints: set[str] | None = None,
 ) -> dict:
-    local_history = copy.deepcopy(history)
-    best_kernel = None
-    best_speedup = 0.0
-    best_score = 0.0
-    local_seen_fingerprints: set[str] = set()
+    attempt, kernel_for_eval = _prepare_generated_attempt(args, raw_text, genm, seen_kernel_fingerprints)
+    if kernel_for_eval is None:
+        return attempt
+    attempt["eval"] = asyncio.run(_evaluate_kernels_batch_async(args, ref_arch_src, [kernel_for_eval]))[0]
+    return attempt
 
-    for h in local_history:
-        ev = h.get("eval", {})
-        fp = h.get("kernel_fingerprint")
-        if fp:
-            local_seen_fingerprints.add(fp)
-        if ev.get("correctness"):
-            s = float(ev.get("speedup_vs_ref", 0.0))
-            score = _kevin_score(ev)
-            if s > best_speedup:
-                best_speedup = s
-                best_kernel = h.get("kernel")
-            if score > best_score:
-                best_score = score
 
-    for step_idx in range(steps):
-        args._seen_kernel_fingerprints = local_seen_fingerprints
-        if local_history:
-            prompt = _build_refinement_prompt(
-                base_prompt=base_prompt,
-                backend=args.backend,
-                include_think=args.include_think,
-                history=local_history,
-            )
-        else:
-            prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
+def _apply_attempt_to_history(history: list[dict], attempt: dict) -> None:
+    carry_summary = attempt.get("summary")
+    if not carry_summary:
+        carry_summary = _fallback_summary(attempt["eval"], categorize_error(attempt["eval"]))
 
-        raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=generation_temperature)
-        attempt = _evaluate_generated_response(args, ref_arch_src, raw, genm)
-        attempt.update(
-            {
-                "round": round_idx,
-                "trajectory_id": trajectory_id,
-                "trajectory_step": step_idx + 1,
-                "generation_temperature": generation_temperature,
-            }
-        )
-        attempts.append(attempt)
-        fp = attempt.get("kernel_fingerprint")
-        if fp:
-            local_seen_fingerprints.add(fp)
-
-        carry_summary = attempt.get("summary")
-        if not carry_summary:
-            carry_summary = _fallback_summary(attempt["eval"], categorize_error(attempt["eval"]))
-
-        local_history.append(
-            {
-                "kernel": attempt.get("kernel", ""),
-                "summary": _truncate_summary(carry_summary),
-                "eval": attempt.get("eval", {}),
-                "kernel_fingerprint": fp,
-            }
-        )
-
-        ev = attempt.get("eval", {})
-        if ev.get("correctness"):
-            s = float(ev.get("speedup_vs_ref", 0.0))
-            score = _kevin_score(ev)
-            if s > best_speedup:
-                best_speedup = s
-                best_kernel = attempt.get("kernel")
-            if score > best_score:
-                best_score = score
-
-    return {
-        "best_kernel": best_kernel,
-        "best_speedup": best_speedup,
-        "best_score": best_score,
-        "history": local_history,
-    }
+    history.append(
+        {
+            "kernel": attempt.get("kernel", ""),
+            "summary": _truncate_summary(carry_summary),
+            "eval": attempt.get("eval", {}),
+            "kernel_fingerprint": attempt.get("kernel_fingerprint"),
+        }
+    )
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -422,31 +370,34 @@ def run(args: argparse.Namespace) -> dict:
     llm = create_model(
         model_backend=args.model_backend,
         model_id=args.model_id,
-        torch_dtype=args.torch_dtype,
-        load_in_4bit=args.load_in_4bit,
-        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
-        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-        vllm_max_model_len=args.vllm_max_model_len,
+        modal_llm_base_url=args.modal_llm_base_url,
+        modal_llm_api_key=args.modal_llm_api_key,
+        modal_llm_timeout_s=args.modal_llm_timeout_s,
+        modal_llm_max_parallel_requests=args.modal_llm_max_parallel_requests,
     )
     attempts: list[dict] = []
 
     if args.technique == "greedy":
         prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
         raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
-        attempts.append(_evaluate_generated_response(args, ref_arch_src, raw, genm))
+        attempts.append(_evaluate_generated_response(args, ref_arch_src, raw, genm, set()))
 
     elif args.technique == "best_of_n":
         prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
         prompt_batch = [prompt for _ in range(args.n_samples)]
         generations = llm.generate_many(prompt_batch, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
+        seen_fingerprints: set[str] = set()
         for raw, genm in generations:
-            attempts.append(_evaluate_generated_response(args, ref_arch_src, raw, genm))
+            attempt = _evaluate_generated_response(args, ref_arch_src, raw, genm, seen_fingerprints)
+            attempts.append(attempt)
+            fp = attempt.get("kernel_fingerprint")
+            if fp:
+                seen_fingerprints.add(fp)
 
     elif args.technique == "serial_refine":
         history: list[dict] = []
         seen_fingerprints: set[str] = set()
         for turn_idx in range(args.turns):
-            args._seen_kernel_fingerprints = seen_fingerprints
             if history:
                 prompt = _build_refinement_prompt(
                     base_prompt=base_prompt,
@@ -458,24 +409,13 @@ def run(args: argparse.Namespace) -> dict:
                 prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
 
             raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
-            attempt = _evaluate_generated_response(args, ref_arch_src, raw, genm)
+            attempt = _evaluate_generated_response(args, ref_arch_src, raw, genm, seen_fingerprints)
             attempts.append(attempt)
             fp = attempt.get("kernel_fingerprint")
             if fp:
                 seen_fingerprints.add(fp)
 
-            carry_summary = attempt.get("summary")
-            if not carry_summary:
-                carry_summary = _fallback_summary(attempt["eval"], categorize_error(attempt["eval"]))
-
-            history.append(
-                {
-                    "kernel": attempt.get("kernel", ""),
-                    "summary": _truncate_summary(carry_summary),
-                    "eval": attempt.get("eval", {}),
-                    "kernel_fingerprint": fp,
-                }
-            )
+            _apply_attempt_to_history(history, attempt)
 
             if args.early_stop_on_correct and attempt.get("eval", {}).get("correctness"):
                 speed = float(attempt["eval"].get("speedup_vs_ref", 0.0))
@@ -498,26 +438,91 @@ def run(args: argparse.Namespace) -> dict:
         )
         for beam_idx in range(args.num_beams):
             trajectories.append(
-                _run_beam_trajectory(
-                    args=args,
-                    llm=llm,
-                    ref_arch_src=ref_arch_src,
-                    base_prompt=base_prompt,
-                    history=[],
-                    steps=args.steps_per_round,
-                    round_idx=1,
-                    trajectory_id=beam_idx,
-                    generation_temperature=round1_temps[beam_idx],
-                    attempts=attempts,
-                )
+                {
+                    "trajectory_id": beam_idx,
+                    "history": [],
+                    "best_kernel": None,
+                    "best_speedup": 0.0,
+                    "best_score": 0.0,
+                    "seen_fingerprints": set(),
+                    "temperature": round1_temps[beam_idx],
+                }
             )
 
-        for round_idx in range(2, args.num_rounds + 1):
+        for round_idx in range(1, args.num_rounds + 1):
+            for step_idx in range(args.steps_per_round):
+                pending_attempts: list[dict] = []
+                eval_indices: list[int] = []
+                eval_kernels: list[str] = []
+
+                for traj in trajectories:
+                    if traj["history"]:
+                        prompt = _build_refinement_prompt(
+                            base_prompt=base_prompt,
+                            backend=args.backend,
+                            include_think=args.include_think,
+                            history=traj["history"],
+                        )
+                    else:
+                        prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
+
+                    raw, genm = llm.generate(
+                        prompt,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=traj["temperature"],
+                    )
+                    attempt, kernel_for_eval = _prepare_generated_attempt(
+                        args,
+                        raw,
+                        genm,
+                        traj["seen_fingerprints"],
+                    )
+                    attempt.update(
+                        {
+                            "round": round_idx,
+                            "trajectory_id": traj["trajectory_id"],
+                            "trajectory_step": step_idx + 1,
+                            "generation_temperature": traj["temperature"],
+                        }
+                    )
+                    pending_attempts.append({"trajectory": traj, "attempt": attempt})
+                    if kernel_for_eval is not None:
+                        eval_indices.append(len(pending_attempts) - 1)
+                        eval_kernels.append(kernel_for_eval)
+
+                if eval_kernels:
+                    eval_results = asyncio.run(_evaluate_kernels_batch_async(args, ref_arch_src, eval_kernels))
+                    for pending_idx, eval_result in zip(eval_indices, eval_results):
+                        pending_attempts[pending_idx]["attempt"]["eval"] = eval_result
+
+                for item in pending_attempts:
+                    traj = item["trajectory"]
+                    attempt = item["attempt"]
+                    attempts.append(attempt)
+
+                    fp = attempt.get("kernel_fingerprint")
+                    if fp:
+                        traj["seen_fingerprints"].add(fp)
+                    _apply_attempt_to_history(traj["history"], attempt)
+
+                    ev = attempt.get("eval", {})
+                    if ev.get("correctness"):
+                        speed = float(ev.get("speedup_vs_ref", 0.0))
+                        score = _kevin_score(ev)
+                        if speed > traj["best_speedup"]:
+                            traj["best_speedup"] = speed
+                            traj["best_kernel"] = attempt.get("kernel")
+                        if score > traj["best_score"]:
+                            traj["best_score"] = score
+
+            if round_idx >= args.num_rounds:
+                continue
+
             trajectories.sort(key=lambda t: t["best_score"], reverse=True)
             survivors = trajectories[: args.beam_width]
-            expanded = []
             clones_per_survivor = args.num_beams // args.beam_width
-            trajectory_id = 0
+            expanded = []
+            new_trajectory_id = 0
             for survivor_rank, survivor in enumerate(survivors):
                 clone_temps = _beam_temperatures(
                     count=clones_per_survivor,
@@ -526,7 +531,6 @@ def run(args: argparse.Namespace) -> dict:
                     min_temp=args.beam_min_temperature,
                     max_temp=args.beam_max_temperature,
                 )
-                # Slight rank-conditioned offset: top survivors get slightly more exploitative temps.
                 rank_offset = min(0.05 * survivor_rank, 0.15)
                 for clone_idx in range(clones_per_survivor):
                     t = max(
@@ -534,20 +538,17 @@ def run(args: argparse.Namespace) -> dict:
                         args.beam_min_temperature,
                     )
                     expanded.append(
-                        _run_beam_trajectory(
-                            args=args,
-                            llm=llm,
-                            ref_arch_src=ref_arch_src,
-                            base_prompt=base_prompt,
-                            history=survivor["history"],
-                            steps=args.steps_per_round,
-                            round_idx=round_idx,
-                            trajectory_id=trajectory_id,
-                            generation_temperature=t,
-                            attempts=attempts,
-                        )
+                        {
+                            "trajectory_id": new_trajectory_id,
+                            "history": copy.deepcopy(survivor["history"]),
+                            "best_kernel": survivor["best_kernel"],
+                            "best_speedup": survivor["best_speedup"],
+                            "best_score": survivor["best_score"],
+                            "seen_fingerprints": set(survivor["seen_fingerprints"]),
+                            "temperature": t,
+                        }
                     )
-                    trajectory_id += 1
+                    new_trajectory_id += 1
             trajectories = expanded
     else:
         raise ValueError(f"Unknown technique: {args.technique}")
@@ -594,10 +595,9 @@ def run(args: argparse.Namespace) -> dict:
             "modal_gpu": args.modal_gpu,
             "modal_timeout_s": args.modal_timeout_s,
             "model_backend": args.model_backend,
-            "load_in_4bit": args.load_in_4bit,
-            "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
-            "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
-            "vllm_max_model_len": args.vllm_max_model_len,
+            "modal_llm_base_url": args.modal_llm_base_url,
+            "modal_llm_timeout_s": args.modal_llm_timeout_s,
+            "modal_llm_max_parallel_requests": args.modal_llm_max_parallel_requests,
             "early_stop_on_correct": args.early_stop_on_correct,
             "speedup_threshold": args.speedup_threshold,
         },
@@ -609,13 +609,11 @@ def run(args: argparse.Namespace) -> dict:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--model-id", default="cognition-ai/Kevin-32B")
-    p.add_argument("--model-backend", default="hf", choices=["hf", "vllm"])
-    p.add_argument("--torch-dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
-    p.add_argument("--load-in-4bit", action="store_true", default=True)
-    p.add_argument("--no-load-in-4bit", dest="load_in_4bit", action="store_false")
-    p.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
-    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.92)
-    p.add_argument("--vllm-max-model-len", type=int, default=32768)
+    p.add_argument("--model-backend", default="modal_openai", choices=["modal_openai"])
+    p.add_argument("--modal-llm-base-url", default=os.getenv("MODAL_LLM_BASE_URL"))
+    p.add_argument("--modal-llm-api-key", default=os.getenv("MODAL_LLM_API_KEY"))
+    p.add_argument("--modal-llm-timeout-s", type=float, default=600.0)
+    p.add_argument("--modal-llm-max-parallel-requests", type=int, default=8)
     p.add_argument("--technique", default="greedy", choices=["greedy", "best_of_n", "serial_refine", "beam_search"])
     p.add_argument("--n-samples", type=int, default=4)
     p.add_argument("--turns", type=int, default=3)

@@ -35,24 +35,19 @@ kevin-kb-run --level 1 --problem-id 1 --technique greedy --max-new-tokens 16384
 python -m kevin_kb_ttt.runner --level 1 --problem-id 1 --technique greedy --max-new-tokens 16384
 ```
 
-## 2b) Kevin-32B Inference Modes
+## 2b) Modal-Only Inference
 
-Use one of these for realistic Kevin-32B runs:
+Inference is remote-only. The runner calls an OpenAI-compatible endpoint hosted on Modal.
 
-- HF + 4-bit quantization (single GPU, lower memory):
+Set:
 ```powershell
-kevin-kb-run --model-backend hf --load-in-4bit --max-new-tokens 16384 ...
+$env:MODAL_LLM_BASE_URL="https://<your-modal-endpoint>/v1"
+$env:MODAL_LLM_API_KEY="<optional-api-key>"
 ```
 
-- vLLM backend (recommended for throughput / beam search):
+or pass flags directly:
 ```powershell
-kevin-kb-run --model-backend vllm --vllm-tensor-parallel-size 1 --vllm-gpu-memory-utilization 0.92 --max-new-tokens 16384 ...
-```
-
-Install extras as needed:
-```powershell
-pip install bitsandbytes
-pip install vllm
+kevin-kb-run --model-backend modal_openai --modal-llm-base-url https://<your-modal-endpoint>/v1 ...
 ```
 
 ## 3) Compare test-time techniques
@@ -78,6 +73,7 @@ The next-turn prompt carries summary + categorized evaluator feedback (format/co
 ## Eval Controls
 
 - Modal is the only supported eval mode.
+- Modal is the only supported inference mode.
 - Eval is executed through exact KB harness script: `third_party/KernelBench/scripts/run_and_check.py`
 - `--modal-gpu`: target Modal GPU (for example `L40S`, `H100`, `A100`)
 - `--modal-timeout-s`: timeout for each Modal evaluation
@@ -87,5 +83,6 @@ The next-turn prompt carries summary + categorized evaluator feedback (format/co
 ## Notes
 
 - Default model id: `cognition-ai/Kevin-32B`
+- Default inference backend: `modal_openai` (no local HF/vLLM loading)
 - Set up Modal auth before running: `modal token new`
 - If you choose `--dataset-source local`, pass `--kb-base-path` explicitly.

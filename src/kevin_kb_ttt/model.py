@@ -1,12 +1,14 @@
-"""Model loading and generation utilities for Kevin-32B."""
+"""Remote model client for Modal-hosted Kevin inference."""
 
 from __future__ import annotations
 
+import json
+import os
 import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 @dataclass
@@ -17,175 +19,121 @@ class GenMetrics:
     decode_tok_s: float
 
 
-class KevinHF:
+class KevinModalOpenAI:
+    """Client for an OpenAI-compatible Modal endpoint.
+
+    Expected endpoint: {base_url}/chat/completions
+    """
+
     def __init__(
         self,
         model_id: str,
-        torch_dtype: str = "auto",
-        load_in_4bit: bool = True,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        timeout_s: float = 600.0,
+        max_parallel_requests: int = 8,
     ) -> None:
-        if torch_dtype == "auto":
-            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        elif torch_dtype == "float16":
-            dtype = torch.float16
-        elif torch_dtype == "bfloat16":
-            dtype = torch.bfloat16
-        else:
-            dtype = torch.float32
+        self.model_id = model_id
+        self.base_url = (base_url or os.getenv("MODAL_LLM_BASE_URL", "")).strip().rstrip("/")
+        if not self.base_url:
+            raise RuntimeError(
+                "Modal inference requires MODAL_LLM_BASE_URL (or --modal-llm-base-url) "
+                "pointing to an OpenAI-compatible endpoint."
+            )
+        self.api_key = (api_key or os.getenv("MODAL_LLM_API_KEY", "")).strip() or None
+        self.timeout_s = timeout_s
+        self.max_parallel_requests = max(1, int(max_parallel_requests))
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-
-        load_kwargs = {
-            "trust_remote_code": True,
-            "device_map": "auto",
-        }
-        if load_in_4bit:
+    def _post_chat(self, payload: dict) -> dict:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url=f"{self.base_url}/chat/completions",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}),
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            err_body = ""
             try:
-                from transformers import BitsAndBytesConfig
+                err_body = e.read().decode("utf-8")
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Modal LLM HTTP {e.code}: {e.reason}. Body: {err_body[:800]}"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"Failed to call Modal LLM endpoint: {e}") from e
 
-                load_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=dtype,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_use_double_quant=True,
-                )
-            except Exception as e:
-                raise RuntimeError(
-                    "load_in_4bit=True requires bitsandbytes + compatible CUDA environment. "
-                    "Install bitsandbytes or disable 4-bit mode with --no-load-in-4bit."
-                ) from e
-        else:
-            load_kwargs["dtype"] = dtype
-
-        self.model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Invalid JSON from Modal LLM endpoint: {raw[:800]}") from e
 
     def generate(self, prompt: str, max_new_tokens: int = 16384, temperature: float = 0.9) -> tuple[str, GenMetrics]:
-        inputs = self.tokenizer(prompt, return_tensors="pt")
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        payload = {
+            "model": self.model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_new_tokens,
+            "stream": False,
+        }
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
         t0 = time.perf_counter()
-
-        out = self.model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=temperature > 0.0,
-            temperature=temperature if temperature > 0.0 else None,
-        )
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        out = self._post_chat(payload)
         t1 = time.perf_counter()
+        total = max(t1 - t0, 1e-9)
 
-        prompt_len = inputs["input_ids"].shape[1]
-        new_tokens = int(out.shape[1] - prompt_len)
-        total = t1 - t0
+        try:
+            text = out["choices"][0]["message"]["content"]
+        except Exception as e:
+            raise RuntimeError(f"Unexpected Modal LLM response shape: {out}") from e
 
-        # Decode only generated continuation, not the prompt.
-        generated = out[0][prompt_len:]
-        text = self.tokenizer.decode(generated, skip_special_tokens=True)
+        usage = out.get("usage", {})
+        tokens_generated = int(usage.get("completion_tokens") or 0)
+        if tokens_generated <= 0:
+            tokens_generated = max(1, len(text.split()))
+
         metrics = GenMetrics(
             ttft_s=-1.0,
             total_s=total,
-            tokens_generated=max(new_tokens, 0),
-            decode_tok_s=(new_tokens / total) if total > 0 and new_tokens > 0 else 0.0,
+            tokens_generated=tokens_generated,
+            decode_tok_s=(tokens_generated / total) if total > 0 else 0.0,
         )
         return text, metrics
 
     def generate_many(self, prompts: list[str], max_new_tokens: int = 16384, temperature: float = 0.9) -> list[tuple[str, GenMetrics]]:
-        results = []
-        for p in prompts:
-            results.append(self.generate(p, max_new_tokens=max_new_tokens, temperature=temperature))
-        return results
-
-
-class KevinVLLM:
-    def __init__(
-        self,
-        model_id: str,
-        torch_dtype: str = "auto",
-        tensor_parallel_size: int = 1,
-        gpu_memory_utilization: float = 0.92,
-        max_model_len: int = 32768,
-    ) -> None:
-        try:
-            from vllm import LLM
-        except Exception as e:
-            raise RuntimeError(
-                "vLLM backend requires `vllm` installed in this environment."
-            ) from e
-
-        dtype = "auto"
-        if torch_dtype == "float16":
-            dtype = "float16"
-        elif torch_dtype == "bfloat16":
-            dtype = "bfloat16"
-
-        self._llm = LLM(
-            model=model_id,
-            trust_remote_code=True,
-            tensor_parallel_size=tensor_parallel_size,
-            dtype=dtype,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=max_model_len,
-        )
-
-    def generate(self, prompt: str, max_new_tokens: int = 16384, temperature: float = 0.9) -> tuple[str, GenMetrics]:
-        return self.generate_many([prompt], max_new_tokens=max_new_tokens, temperature=temperature)[0]
-
-    def generate_many(self, prompts: list[str], max_new_tokens: int = 16384, temperature: float = 0.9) -> list[tuple[str, GenMetrics]]:
-        from vllm import SamplingParams
-
-        params = SamplingParams(
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=1.0,
-            n=1,
-        )
-        t0 = time.perf_counter()
-        outputs = self._llm.generate(prompts, params)
-        t1 = time.perf_counter()
-
-        total = max(t1 - t0, 1e-9)
-        per_sample_time = total / max(len(outputs), 1)
-
-        results: list[tuple[str, GenMetrics]] = []
-        for out in outputs:
-            cand = out.outputs[0]
-            tok_n = len(cand.token_ids)
-            metrics = GenMetrics(
-                ttft_s=-1.0,
-                total_s=per_sample_time,
-                tokens_generated=tok_n,
-                decode_tok_s=(tok_n / per_sample_time) if per_sample_time > 0 and tok_n > 0 else 0.0,
-            )
-            results.append((cand.text, metrics))
-        return results
+        if not prompts:
+            return []
+        workers = min(self.max_parallel_requests, len(prompts))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(self.generate, p, max_new_tokens, temperature) for p in prompts]
+            return [f.result() for f in futures]
 
 
 def create_model(
     *,
     model_backend: str,
     model_id: str,
-    torch_dtype: str,
-    load_in_4bit: bool,
-    vllm_tensor_parallel_size: int,
-    vllm_gpu_memory_utilization: float,
-    vllm_max_model_len: int,
+    modal_llm_base_url: str | None,
+    modal_llm_api_key: str | None,
+    modal_llm_timeout_s: float,
+    modal_llm_max_parallel_requests: int,
 ):
-    if model_backend == "vllm":
-        return KevinVLLM(
-            model_id=model_id,
-            torch_dtype=torch_dtype,
-            tensor_parallel_size=vllm_tensor_parallel_size,
-            gpu_memory_utilization=vllm_gpu_memory_utilization,
-            max_model_len=vllm_max_model_len,
+    if model_backend != "modal_openai":
+        raise ValueError(
+            f"Unknown model backend: {model_backend}. "
+            "This repo is configured for Modal-only inference; use --model-backend modal_openai."
         )
-    if model_backend == "hf":
-        return KevinHF(
-            model_id=model_id,
-            torch_dtype=torch_dtype,
-            load_in_4bit=load_in_4bit,
-        )
-    raise ValueError(f"Unknown model backend: {model_backend}")
+    return KevinModalOpenAI(
+        model_id=model_id,
+        base_url=modal_llm_base_url,
+        api_key=modal_llm_api_key,
+        timeout_s=modal_llm_timeout_s,
+        max_parallel_requests=modal_llm_max_parallel_requests,
+    )
