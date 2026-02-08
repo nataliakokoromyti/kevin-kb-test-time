@@ -44,27 +44,31 @@ Do not use custom wrapper tags like <KERNEL> or <SUMMARY>.
 """
 
 REFINEMENT_TEMPLATE = """
-## Previous Attempt (Turn {turn})
+## Prior Attempts
+{history_block}
 
-## Previous Summary
-{previous_summary}
+## Instructions
+Use the full trajectory above. Keep what worked and avoid repeating failed patterns.
+Focus on fixing the latest failure while preserving prior gains.
+{latest_guidance}
+"""
 
-```python
-{previous_kernel}
-```
-
-## Evaluation Feedback
+ATTEMPT_BLOCK_TEMPLATE = """
+### Attempt {turn}
 - Status: {error_category}
 - Compiled: {compiled}
 - Tests Passed: {tests_passed}/{tests_total}
 {speedup_line}
 
+Summary:
+{summary}
+
+Kernel:
+```python
+{kernel}
+```
+
 {error_section}
-
-## Instructions
-{guidance}
-
-Keep what works. Avoid PyTorch wrappers for core compute.
 """
 
 
@@ -117,36 +121,48 @@ def _build_refinement_prompt(
     base_prompt: str,
     backend: str,
     include_think: bool,
-    turn_idx: int,
-    last_entry: dict,
+    history: list[dict],
 ) -> str:
-    eval_result = last_entry.get("eval", {})
-    error_category = categorize_error(eval_result)
-    speedup = eval_result.get("speedup_vs_ref")
-    speedup_line = ""
-    if isinstance(speedup, (int, float)) and speedup >= 0:
-        speedup_line = f"- Speedup: {speedup:.2f}x"
+    if not history:
+        return _build_initial_prompt(base_prompt, backend, include_think)
 
-    err_msg = eval_result.get("error_message")
-    err_text = extract_key_error(err_msg)
-    error_section = ""
-    if err_text and error_category != "success":
-        error_section = f"Error Details:\n```\n{err_text}\n```"
+    blocks: list[str] = []
+    latest_error_category = "success"
+    for idx, entry in enumerate(history, start=1):
+        eval_result = entry.get("eval", {})
+        error_category = categorize_error(eval_result)
+        latest_error_category = error_category
+        speedup = eval_result.get("speedup_vs_ref")
+        speedup_line = ""
+        if isinstance(speedup, (int, float)) and speedup >= 0:
+            speedup_line = f"- Speedup: {speedup:.2f}x"
 
-    summary = last_entry.get("summary") or _fallback_summary(eval_result, error_category)
-    summary = _truncate_summary(summary)
+        err_msg = eval_result.get("error_message")
+        err_text = extract_key_error(err_msg)
+        error_section = ""
+        if err_text and error_category != "success":
+            error_section = f"Error Details:\n```\n{err_text}\n```"
+
+        summary = entry.get("summary") or _fallback_summary(eval_result, error_category)
+        summary = _truncate_summary(summary)
+
+        blocks.append(
+            ATTEMPT_BLOCK_TEMPLATE.format(
+                turn=idx,
+                error_category=_error_category_display(error_category),
+                compiled="Yes" if eval_result.get("compiled") else "No",
+                tests_passed=eval_result.get("tests_passed", 0),
+                tests_total=eval_result.get("tests_total", 0),
+                speedup_line=speedup_line,
+                summary=summary,
+                kernel=_truncate_kernel(entry.get("kernel", "")),
+                error_section=error_section,
+            )
+        )
 
     refinement = REFINEMENT_TEMPLATE.format(
-        turn=turn_idx,
-        previous_summary=summary,
-        previous_kernel=_truncate_kernel(last_entry.get("kernel", "")),
-        error_category=_error_category_display(error_category),
-        compiled="Yes" if eval_result.get("compiled") else "No",
-        tests_passed=eval_result.get("tests_passed", 0),
-        tests_total=eval_result.get("tests_total", 0),
-        speedup_line=speedup_line,
-        error_section=error_section,
-        guidance=get_error_guidance(error_category, backend),
+        history_block="\n".join(blocks),
+        latest_guidance=get_error_guidance(latest_error_category, backend),
     )
 
     system = STRUCTURED_SYSTEM_WITH_THINK if include_think else STRUCTURED_SYSTEM_NO_THINK
@@ -263,8 +279,7 @@ def _run_beam_trajectory(
                 base_prompt=base_prompt,
                 backend=args.backend,
                 include_think=args.include_think,
-                turn_idx=len(local_history),
-                last_entry=local_history[-1],
+                history=local_history,
             )
         else:
             prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
@@ -344,8 +359,7 @@ def run(args: argparse.Namespace) -> dict:
                     base_prompt=base_prompt,
                     backend=args.backend,
                     include_think=args.include_think,
-                    turn_idx=turn_idx,
-                    last_entry=history[-1],
+                    history=history,
                 )
             else:
                 prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
