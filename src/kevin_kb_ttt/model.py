@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Sequence
 
 
 @dataclass
@@ -107,12 +108,25 @@ class KevinModalOpenAI:
         )
         return text, metrics
 
-    def generate_many(self, prompts: list[str], max_new_tokens: int = 16384, temperature: float = 0.9) -> list[tuple[str, GenMetrics]]:
+    def generate_many(
+        self,
+        prompts: list[str],
+        max_new_tokens: int = 16384,
+        temperature: float = 0.9,
+        temperatures: Sequence[float] | None = None,
+    ) -> list[tuple[str, GenMetrics]]:
         if not prompts:
             return []
+        if temperatures is not None and len(temperatures) != len(prompts):
+            raise ValueError("temperatures length must match prompts length")
+        if temperatures is None:
+            temperatures = [temperature] * len(prompts)
         workers = min(self.max_parallel_requests, len(prompts))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(self.generate, p, max_new_tokens, temperature) for p in prompts]
+            futures = [
+                pool.submit(self.generate, prompts[i], max_new_tokens, float(temperatures[i]))
+                for i in range(len(prompts))
+            ]
             return [f.result() for f in futures]
 
 

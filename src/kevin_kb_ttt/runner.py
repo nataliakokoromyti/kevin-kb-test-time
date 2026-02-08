@@ -596,9 +596,13 @@ def run(args: argparse.Namespace) -> dict:
                 pending_attempts: list[dict] = []
                 eval_indices: list[int] = []
                 eval_kernels: list[str] = []
+                prompt_batch: list[str] = []
+                temp_batch: list[float] = []
+                parent_attempt_ids: list[int | None] = []
 
                 for traj in trajectories:
                     parent_attempt_id = _parent_attempt_id_from_history(traj["history"])
+                    parent_attempt_ids.append(parent_attempt_id)
                     if traj["history"]:
                         prompt = _build_refinement_prompt(
                             base_prompt=base_prompt,
@@ -608,12 +612,19 @@ def run(args: argparse.Namespace) -> dict:
                         )
                     else:
                         prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
+                    prompt_batch.append(prompt)
+                    temp_batch.append(float(traj["temperature"]))
 
-                    raw, genm = llm.generate(
-                        prompt,
-                        max_new_tokens=args.max_new_tokens,
-                        temperature=traj["temperature"],
-                    )
+                generations = llm.generate_many(
+                    prompt_batch,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.beam_temperature,
+                    temperatures=temp_batch,
+                )
+
+                for idx, traj in enumerate(trajectories):
+                    raw, genm = generations[idx]
+                    parent_attempt_id = parent_attempt_ids[idx]
                     attempt, kernel_for_eval = _prepare_generated_attempt(
                         args,
                         raw,
