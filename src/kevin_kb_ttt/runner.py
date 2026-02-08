@@ -176,17 +176,7 @@ def _puct_select_state(states: list[dict], exploration_coeff: float, total_expan
     if not states:
         raise ValueError("PUCT buffer is empty")
 
-    sorted_indices = sorted(
-        range(len(states)),
-        key=lambda i: float(states[i].get("best_score", 0.0)),
-        reverse=True,
-    )
-    rank_prior: dict[int, float] = {}
-    for rank, idx in enumerate(sorted_indices):
-        rank_prior[idx] = 1.0 / (rank + 1)
-    total_prior = sum(rank_prior.values())
-    for idx in rank_prior:
-        rank_prior[idx] /= total_prior
+    rank_prior = _compute_puct_rank_prior(states)
 
     best_idx = 0
     best_puct_score = float("-inf")
@@ -202,6 +192,21 @@ def _puct_select_state(states: list[dict], exploration_coeff: float, total_expan
     return best_idx
 
 
+def _compute_puct_rank_prior(states: list[dict]) -> dict[int, float]:
+    sorted_indices = sorted(
+        range(len(states)),
+        key=lambda i: float(states[i].get("best_score", 0.0)),
+        reverse=True,
+    )
+    rank_prior: dict[int, float] = {}
+    for rank, idx in enumerate(sorted_indices):
+        rank_prior[idx] = 1.0 / (rank + 1)
+    total_prior = sum(rank_prior.values())
+    for idx in rank_prior:
+        rank_prior[idx] /= total_prior
+    return rank_prior
+
+
 def _puct_select_batch_states(
     states: list[dict],
     exploration_coeff: float,
@@ -214,20 +219,9 @@ def _puct_select_batch_states(
     temp_visits = [int(s.get("visit_count", 0)) for s in states]
     selected: list[int] = []
     T = total_expansions
+    rank_prior = _compute_puct_rank_prior(states)
 
     while len(selected) < min(batch_size, len(states)):
-        sorted_indices = sorted(
-            range(len(states)),
-            key=lambda i: float(states[i].get("best_score", 0.0)),
-            reverse=True,
-        )
-        rank_prior: dict[int, float] = {}
-        for rank, idx in enumerate(sorted_indices):
-            rank_prior[idx] = 1.0 / (rank + 1)
-        total_prior = sum(rank_prior.values())
-        for idx in rank_prior:
-            rank_prior[idx] /= total_prior
-
         best_idx = None
         best_puct_score = float("-inf")
         for idx, state in enumerate(states):
