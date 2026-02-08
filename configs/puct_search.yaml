@@ -15,6 +15,7 @@ puct_total_rollouts: 128
 puct_init_rollouts: 16
 puct_steps_per_rollout: 4
 puct_exploration_coeff: 1.0
+puct_parallel_rollouts: 8
 include_think: false
 eval_timeout_s: 120
 cache_results: true
