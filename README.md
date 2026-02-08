@@ -30,9 +30,9 @@ git submodule update --init --recursive
 ## 2) Smoke run (single problem)
 
 ```powershell
-kevin-kb-run --level 1 --problem-id 1 --technique greedy --max-new-tokens 512
+kevin-kb-run --level 1 --problem-id 1 --technique greedy --max-new-tokens 16384
 # fallback if script PATH is stale:
-python -m kevin_kb_ttt.runner --level 1 --problem-id 1 --technique greedy --max-new-tokens 512
+python -m kevin_kb_ttt.runner --level 1 --problem-id 1 --technique greedy --max-new-tokens 16384
 ```
 
 ## 3) Compare test-time techniques
@@ -62,6 +62,7 @@ The next-turn prompt carries summary + categorized evaluator feedback (format/co
 - `--modal-gpu`: target Modal GPU (for example `L40S`, `H100`, `A100`)
 - `--modal-timeout-s`: timeout for each Modal evaluation
 - `--cache-results` / `--no-cache-results`: LRU cache for duplicate kernels
+- `--max-new-tokens`: use high values (recommended `16384`; minimum `8192`), otherwise Kevin generations get truncated
 
 ## Notes
 

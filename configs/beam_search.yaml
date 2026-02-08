@@ -9,7 +9,7 @@ num_perf_trials: 100
 precision: fp32
 backend: cuda
 prompt_option: one_shot
-max_new_tokens: 768
+max_new_tokens: 16384
 temperature: 0.0
 num_beams: 16
 beam_width: 4

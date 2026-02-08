@@ -498,7 +498,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--precision", default="fp32", choices=["fp32", "fp16", "bf16"])
     p.add_argument("--backend", default="cuda")
     p.add_argument("--prompt-option", default="one_shot", choices=["zero_shot", "one_shot", "few_shot"])
-    p.add_argument("--max-new-tokens", type=int, default=768)
+    p.add_argument("--max-new-tokens", type=int, default=16384)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--include-think", action="store_true", default=False)
     p.add_argument("--eval-timeout-s", type=float, default=120.0)
