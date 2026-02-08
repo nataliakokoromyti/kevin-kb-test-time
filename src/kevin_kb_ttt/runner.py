@@ -1034,8 +1034,23 @@ async def run_async(args: argparse.Namespace) -> dict:
             raise ValueError("puct_init_rollouts must be <= puct_total_rollouts")
 
         puct_states: list[dict] = []
+        state_index_by_id: dict[int, int] = {}
         puct_total_expansions = 0
         next_state_id = 0
+
+        def _add_puct_state(state: dict) -> None:
+            puct_states.append(state)
+            state_index_by_id[int(state["state_id"])] = len(puct_states) - 1
+
+        def _propagate_best_child_score(start_state_id: int | None, child_best_score: float) -> None:
+            state_id = start_state_id
+            while state_id is not None:
+                idx = state_index_by_id.get(int(state_id))
+                if idx is None:
+                    break
+                state = puct_states[idx]
+                state["best_child_score"] = max(float(state.get("best_child_score", 0.0)), child_best_score)
+                state_id = state.get("parent_state_id")
 
         async def run_puct_rollout_batch(rollout_jobs: list[dict]) -> list[dict]:
             nonlocal next_attempt_id
@@ -1160,9 +1175,9 @@ async def run_async(args: argparse.Namespace) -> dict:
             completed = await run_puct_rollout_batch(seed_jobs)
             for job in completed:
                 best_score, best_speedup, best_kernel = _history_best_metrics(job["history"])
-                puct_states.append(
+                _add_puct_state(
                     {
-                        "state_id": job["state_id"],
+                        "state_id": int(job["state_id"]),
                         "history": job["history"],
                         "seen_fingerprints": job["seen"],
                         "best_score": best_score,
@@ -1230,7 +1245,6 @@ async def run_async(args: argparse.Namespace) -> dict:
                     {
                         "state_id": state_id,
                         "parent_state_id": parent_state["state_id"],
-                        "parent_idx": selected_idx,
                         "rollout_index": rollout_idx,
                         "history_seed": parent_state["history"],
                         "seen_seed": parent_state["seen_fingerprints"],
@@ -1240,9 +1254,9 @@ async def run_async(args: argparse.Namespace) -> dict:
             completed = await run_puct_rollout_batch(expansion_jobs)
             for job in completed:
                 child_best_score, child_best_speedup, child_best_kernel = _history_best_metrics(job["history"])
-                puct_states.append(
+                _add_puct_state(
                     {
-                        "state_id": job["state_id"],
+                        "state_id": int(job["state_id"]),
                         "history": job["history"],
                         "seen_fingerprints": job["seen"],
                         "best_score": child_best_score,
@@ -1253,14 +1267,7 @@ async def run_async(args: argparse.Namespace) -> dict:
                         "parent_state_id": job["parent_state_id"],
                     }
                 )
-                for parent_job in expansion_jobs:
-                    if parent_job["state_id"] == job["state_id"]:
-                        parent_state = puct_states[parent_job["parent_idx"]]
-                        parent_state["best_child_score"] = max(
-                            float(parent_state.get("best_child_score", 0.0)),
-                            child_best_score,
-                        )
-                        break
+                _propagate_best_child_score(job.get("parent_state_id"), child_best_score)
 
                 best_attempt = _compute_best_attempt(attempts)
                 best_speedup = -1.0
