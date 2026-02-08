@@ -5,6 +5,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import math
 import os
 from dataclasses import asdict
 from datetime import datetime
@@ -152,6 +153,53 @@ def _beam_temperatures(
         t = max(min(t, max_temp), min_temp)
         temps.append(t)
     return temps
+
+
+def _history_best_metrics(history: list[dict]) -> tuple[float, float, str | None]:
+    best_score = 0.0
+    best_speedup = 0.0
+    best_kernel = None
+    for item in history:
+        ev = item.get("eval", {})
+        if not ev.get("correctness"):
+            continue
+        score = _kevin_score(ev)
+        speedup = float(ev.get("speedup_vs_ref", 0.0))
+        if score > best_score or (score == best_score and speedup > best_speedup):
+            best_score = score
+            best_speedup = speedup
+            best_kernel = item.get("kernel")
+    return best_score, best_speedup, best_kernel
+
+
+def _puct_select_state(states: list[dict], exploration_coeff: float, total_expansions: int) -> int:
+    if not states:
+        raise ValueError("PUCT buffer is empty")
+
+    sorted_indices = sorted(
+        range(len(states)),
+        key=lambda i: float(states[i].get("best_speedup", 0.0)),
+        reverse=True,
+    )
+    rank_prior: dict[int, float] = {}
+    for rank, idx in enumerate(sorted_indices):
+        rank_prior[idx] = 1.0 / (rank + 1)
+    total_prior = sum(rank_prior.values())
+    for idx in rank_prior:
+        rank_prior[idx] /= total_prior
+
+    best_idx = 0
+    best_puct_score = float("-inf")
+    T = total_expansions
+    for idx, state in enumerate(states):
+        q_value = float(state.get("best_child_score", 0.0))
+        prior = rank_prior[idx]
+        visits = int(state.get("visit_count", 0))
+        puct_score = q_value + exploration_coeff * prior * math.sqrt(1 + T) / (1 + visits)
+        if puct_score > best_puct_score:
+            best_puct_score = puct_score
+            best_idx = idx
+    return best_idx
 
 
 def _build_initial_prompt(base_prompt: str, backend: str, include_think: bool) -> list[dict[str, str]]:
@@ -590,6 +638,10 @@ async def run_async(args: argparse.Namespace) -> dict:
         "beam_width": args.beam_width,
         "steps_per_round": args.steps_per_round,
         "num_rounds": args.num_rounds,
+        "puct_total_rollouts": args.puct_total_rollouts,
+        "puct_init_rollouts": args.puct_init_rollouts,
+        "puct_steps_per_rollout": args.puct_steps_per_rollout,
+        "puct_exploration_coeff": args.puct_exploration_coeff,
         "beam_temperature": args.beam_temperature,
         "beam_temp_jitter": args.beam_temp_jitter,
         "beam_min_temperature": args.beam_min_temperature,
@@ -929,6 +981,192 @@ async def run_async(args: argparse.Namespace) -> dict:
                     progress=progress,
                 )
                 _write_intermediate_result(args, run_id, f"round_{round_idx:02d}_post_prune", checkpoint_payload)
+    elif args.technique == "puct_search":
+        if args.puct_init_rollouts > args.puct_total_rollouts:
+            raise ValueError("puct_init_rollouts must be <= puct_total_rollouts")
+
+        puct_states: list[dict] = []
+        puct_total_expansions = 0
+        next_state_id = 0
+
+        async def run_puct_rollout(
+            *,
+            history_seed: list[dict],
+            seen_seed: set[str],
+            state_id: int,
+            parent_state_id: int | None,
+            rollout_index: int,
+        ) -> tuple[list[dict], set[str]]:
+            nonlocal next_attempt_id
+            local_history = copy.deepcopy(history_seed)
+            local_seen = set(seen_seed)
+
+            for step_idx in range(args.puct_steps_per_rollout):
+                parent_attempt_id = _parent_attempt_id_from_history(local_history)
+                if local_history:
+                    prompt = _build_refinement_prompt(
+                        base_prompt=base_prompt,
+                        backend=args.backend,
+                        include_think=args.include_think,
+                        history=local_history,
+                        max_prompt_tokens=args.max_prompt_tokens,
+                        trim_history=args.trim_history_to_fit,
+                        warning_tokens=args.prompt_warning_tokens,
+                        context_label=f"puct rollout={rollout_index + 1} step={step_idx + 1} state={state_id}",
+                    )
+                else:
+                    prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
+                    _warn_prompt_size_if_needed(
+                        messages=prompt,
+                        warning_tokens=args.prompt_warning_tokens,
+                        context_label=f"puct rollout={rollout_index + 1} step={step_idx + 1} state={state_id}",
+                    )
+
+                raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
+                attempt = await _evaluate_generated_response_async(args, ref_arch_src, raw, genm, local_seen)
+                attempt.update(
+                    {
+                        "attempt_id": next_attempt_id,
+                        "parent_attempt_id": parent_attempt_id,
+                        "round": rollout_index + 1,
+                        "trajectory_id": state_id,
+                        "parent_trajectory_id": parent_state_id,
+                        "trajectory_step": step_idx + 1,
+                        "generation_temperature": args.temperature,
+                    }
+                )
+                next_attempt_id += 1
+                _ensure_attempt_eval(attempt)
+                attempts.append(attempt)
+
+                fp = attempt.get("kernel_fingerprint")
+                if fp:
+                    local_seen.add(fp)
+                _apply_attempt_to_history(local_history, attempt)
+
+                if args.early_stop_on_correct and attempt.get("eval", {}).get("correctness"):
+                    speed = float(attempt["eval"].get("speedup_vs_ref", 0.0))
+                    if args.speedup_threshold is None or speed >= args.speedup_threshold:
+                        break
+
+            return local_history, local_seen
+
+        # Seed state buffer from empty history.
+        for rollout_idx in range(args.puct_init_rollouts):
+            state_id = next_state_id
+            next_state_id += 1
+            child_history, child_seen = await run_puct_rollout(
+                history_seed=[],
+                seen_seed=set(),
+                state_id=state_id,
+                parent_state_id=None,
+                rollout_index=rollout_idx,
+            )
+            best_score, best_speedup, best_kernel = _history_best_metrics(child_history)
+            puct_states.append(
+                {
+                    "state_id": state_id,
+                    "history": child_history,
+                    "seen_fingerprints": child_seen,
+                    "best_score": best_score,
+                    "best_speedup": best_speedup,
+                    "best_kernel": best_kernel,
+                    "best_child_score": best_score,
+                    "visit_count": 0,
+                    "parent_state_id": None,
+                }
+            )
+            puct_total_expansions += 1
+            best_attempt = _compute_best_attempt(attempts)
+            best_speedup = -1.0
+            if best_attempt is not None:
+                best_speedup = float(best_attempt.get("eval", {}).get("speedup_vs_ref", -1.0))
+            print(
+                f"[puct] seed_rollout={rollout_idx + 1}/{args.puct_init_rollouts} states={len(puct_states)} "
+                f"best_speedup={best_speedup:.2f}x"
+            )
+            if args.save_intermediate:
+                progress = {
+                    "status": "in_progress",
+                    "phase": "seed",
+                    "rollout": rollout_idx + 1,
+                    "total_rollouts": args.puct_total_rollouts,
+                    "states_total": len(puct_states),
+                    "attempts_total": len(attempts),
+                    "best_speedup_vs_ref": best_speedup,
+                }
+                checkpoint_payload = _make_result_payload(
+                    args=args,
+                    problem_name=problem_name,
+                    attempts=attempts,
+                    settings=settings,
+                    progress=progress,
+                )
+                _write_intermediate_result(args, run_id, f"puct_seed_{rollout_idx + 1:03d}", checkpoint_payload)
+
+        remaining = args.puct_total_rollouts - args.puct_init_rollouts
+        for i in range(remaining):
+            selected_idx = _puct_select_state(
+                puct_states,
+                exploration_coeff=args.puct_exploration_coeff,
+                total_expansions=puct_total_expansions,
+            )
+            parent_state = puct_states[selected_idx]
+            parent_state["visit_count"] = int(parent_state.get("visit_count", 0)) + 1
+            puct_total_expansions += 1
+
+            rollout_idx = args.puct_init_rollouts + i
+            state_id = next_state_id
+            next_state_id += 1
+            child_history, child_seen = await run_puct_rollout(
+                history_seed=parent_state["history"],
+                seen_seed=parent_state["seen_fingerprints"],
+                state_id=state_id,
+                parent_state_id=parent_state["state_id"],
+                rollout_index=rollout_idx,
+            )
+            child_best_score, child_best_speedup, child_best_kernel = _history_best_metrics(child_history)
+            puct_states.append(
+                {
+                    "state_id": state_id,
+                    "history": child_history,
+                    "seen_fingerprints": child_seen,
+                    "best_score": child_best_score,
+                    "best_speedup": child_best_speedup,
+                    "best_kernel": child_best_kernel,
+                    "best_child_score": child_best_score,
+                    "visit_count": 0,
+                    "parent_state_id": parent_state["state_id"],
+                }
+            )
+            parent_state["best_child_score"] = max(float(parent_state.get("best_child_score", 0.0)), child_best_score)
+
+            best_attempt = _compute_best_attempt(attempts)
+            best_speedup = -1.0
+            if best_attempt is not None:
+                best_speedup = float(best_attempt.get("eval", {}).get("speedup_vs_ref", -1.0))
+            print(
+                f"[puct] rollout={rollout_idx + 1}/{args.puct_total_rollouts} states={len(puct_states)} "
+                f"best_speedup={best_speedup:.2f}x"
+            )
+            if args.save_intermediate:
+                progress = {
+                    "status": "in_progress",
+                    "rollout": rollout_idx + 1,
+                    "total_rollouts": args.puct_total_rollouts,
+                    "states_total": len(puct_states),
+                    "attempts_total": len(attempts),
+                    "best_speedup_vs_ref": best_speedup,
+                    "selected_parent_state_id": parent_state["state_id"],
+                }
+                checkpoint_payload = _make_result_payload(
+                    args=args,
+                    problem_name=problem_name,
+                    attempts=attempts,
+                    settings=settings,
+                    progress=progress,
+                )
+                _write_intermediate_result(args, run_id, f"puct_rollout_{rollout_idx + 1:03d}", checkpoint_payload)
     else:
         raise ValueError(f"Unknown technique: {args.technique}")
     return _make_result_payload(
@@ -951,13 +1189,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--modal-llm-api-key", default=os.getenv("MODAL_LLM_API_KEY"))
     p.add_argument("--modal-llm-timeout-s", type=float, default=600.0)
     p.add_argument("--modal-llm-max-parallel-requests", type=int, default=8)
-    p.add_argument("--technique", default="greedy", choices=["greedy", "best_of_n", "serial_refine", "beam_search"])
+    p.add_argument(
+        "--technique",
+        default="greedy",
+        choices=["greedy", "best_of_n", "serial_refine", "beam_search", "puct_search"],
+    )
     p.add_argument("--n-samples", type=int, default=4)
     p.add_argument("--turns", type=int, default=3)
     p.add_argument("--num-beams", type=int, default=16)
     p.add_argument("--beam-width", type=int, default=4)
     p.add_argument("--steps-per-round", type=int, default=4)
     p.add_argument("--num-rounds", type=int, default=2)
+    p.add_argument("--puct-total-rollouts", type=int, default=128)
+    p.add_argument("--puct-init-rollouts", type=int, default=16)
+    p.add_argument("--puct-steps-per-rollout", type=int, default=4)
+    p.add_argument("--puct-exploration-coeff", type=float, default=1.0)
     p.add_argument("--beam-temperature", type=float, default=0.9)
     p.add_argument("--beam-temp-jitter", type=float, default=0.2)
     p.add_argument("--beam-min-temperature", type=float, default=0.6)

@@ -56,6 +56,7 @@ kevin-kb-run --model-backend modal_openai --modal-llm-base-url https://<your-mod
 kevin-kb-run --level 1 --problem-id 1 --technique best_of_n --n-samples 4
 kevin-kb-run --level 1 --problem-id 1 --technique serial_refine --turns 3 --modal-gpu L40S --modal-timeout-s 120 --cache-results
 kevin-kb-run --level 1 --problem-id 1 --technique beam_search --num-beams 16 --beam-width 4 --steps-per-round 4 --num-rounds 2 --beam-temperature 0.9 --modal-gpu L40S --modal-timeout-s 120 --cache-results
+kevin-kb-run --level 1 --problem-id 1 --technique puct_search --puct-total-rollouts 128 --puct-init-rollouts 16 --puct-steps-per-rollout 4 --puct-exploration-coeff 1.0 --temperature 0.9 --modal-gpu L40S --modal-timeout-s 120 --cache-results
 ```
 
 Results are written to `results/*.json`.
