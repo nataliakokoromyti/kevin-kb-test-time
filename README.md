@@ -35,6 +35,26 @@ kevin-kb-run --level 1 --problem-id 1 --technique greedy --max-new-tokens 16384
 python -m kevin_kb_ttt.runner --level 1 --problem-id 1 --technique greedy --max-new-tokens 16384
 ```
 
+## 2b) Kevin-32B Inference Modes
+
+Use one of these for realistic Kevin-32B runs:
+
+- HF + 4-bit quantization (single GPU, lower memory):
+```powershell
+kevin-kb-run --model-backend hf --load-in-4bit --max-new-tokens 16384 ...
+```
+
+- vLLM backend (recommended for throughput / beam search):
+```powershell
+kevin-kb-run --model-backend vllm --vllm-tensor-parallel-size 1 --vllm-gpu-memory-utilization 0.92 --max-new-tokens 16384 ...
+```
+
+Install extras as needed:
+```powershell
+pip install bitsandbytes
+pip install vllm
+```
+
 ## 3) Compare test-time techniques
 
 ```powershell

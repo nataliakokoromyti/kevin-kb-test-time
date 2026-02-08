@@ -17,7 +17,7 @@ from .kb_pipeline import (
     get_problem,
     parse_structured_response,
 )
-from .model import KevinHF
+from .model import create_model
 
 MAX_KERNEL_HISTORY_LEN = 2000
 MAX_SUMMARY_CHARS = 800
@@ -237,7 +237,7 @@ def _evaluate_generated_response(args: argparse.Namespace, ref_arch_src: str, ra
 
 def _run_beam_trajectory(
     args: argparse.Namespace,
-    llm: KevinHF,
+    llm,
     ref_arch_src: str,
     base_prompt: str,
     history: list[dict],
@@ -322,7 +322,15 @@ def run(args: argparse.Namespace) -> dict:
         precision=args.precision,
     )
 
-    llm = KevinHF(args.model_id, torch_dtype=args.torch_dtype)
+    llm = create_model(
+        model_backend=args.model_backend,
+        model_id=args.model_id,
+        torch_dtype=args.torch_dtype,
+        load_in_4bit=args.load_in_4bit,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_max_model_len=args.vllm_max_model_len,
+    )
     attempts: list[dict] = []
 
     if args.technique == "greedy":
@@ -332,8 +340,9 @@ def run(args: argparse.Namespace) -> dict:
 
     elif args.technique == "best_of_n":
         prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
-        for _ in range(args.n_samples):
-            raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
+        prompt_batch = [prompt for _ in range(args.n_samples)]
+        generations = llm.generate_many(prompt_batch, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
+        for raw, genm in generations:
             attempts.append(_evaluate_generated_response(args, ref_arch_src, raw, genm))
 
     elif args.technique == "serial_refine":
@@ -456,6 +465,11 @@ def run(args: argparse.Namespace) -> dict:
             "use_modal": True,
             "modal_gpu": args.modal_gpu,
             "modal_timeout_s": args.modal_timeout_s,
+            "model_backend": args.model_backend,
+            "load_in_4bit": args.load_in_4bit,
+            "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
+            "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+            "vllm_max_model_len": args.vllm_max_model_len,
             "early_stop_on_correct": args.early_stop_on_correct,
             "speedup_threshold": args.speedup_threshold,
         },
@@ -467,7 +481,13 @@ def run(args: argparse.Namespace) -> dict:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--model-id", default="cognition-ai/Kevin-32B")
+    p.add_argument("--model-backend", default="hf", choices=["hf", "vllm"])
     p.add_argument("--torch-dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
+    p.add_argument("--load-in-4bit", action="store_true", default=True)
+    p.add_argument("--no-load-in-4bit", dest="load_in_4bit", action="store_false")
+    p.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.92)
+    p.add_argument("--vllm-max-model-len", type=int, default=32768)
     p.add_argument("--technique", default="greedy", choices=["greedy", "best_of_n", "serial_refine", "beam_search"])
     p.add_argument("--n-samples", type=int, default=4)
     p.add_argument("--turns", type=int, default=3)
