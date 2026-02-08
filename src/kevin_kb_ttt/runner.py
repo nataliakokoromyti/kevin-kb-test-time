@@ -153,9 +153,12 @@ def _beam_temperatures(
     return temps
 
 
-def _build_initial_prompt(base_prompt: str, backend: str, include_think: bool) -> str:
+def _build_initial_prompt(base_prompt: str, backend: str, include_think: bool) -> list[dict[str, str]]:
     system = STRUCTURED_SYSTEM_WITH_THINK if include_think else STRUCTURED_SYSTEM_NO_THINK
-    return system.format(backend=backend.upper()) + "\n\n" + base_prompt
+    return [
+        {"role": "system", "content": system.format(backend=backend.upper())},
+        {"role": "user", "content": base_prompt},
+    ]
 
 
 def _build_refinement_prompt(
@@ -163,7 +166,7 @@ def _build_refinement_prompt(
     backend: str,
     include_think: bool,
     history: list[dict],
-) -> str:
+) -> list[dict[str, str]]:
     if not history:
         return _build_initial_prompt(base_prompt, backend, include_think)
 
@@ -207,7 +210,11 @@ def _build_refinement_prompt(
     )
 
     system = STRUCTURED_SYSTEM_WITH_THINK if include_think else STRUCTURED_SYSTEM_NO_THINK
-    return system.format(backend=backend.upper()) + "\n\n" + base_prompt + "\n\n" + refinement
+    user_content = base_prompt + "\n\n" + refinement
+    return [
+        {"role": "system", "content": system.format(backend=backend.upper())},
+        {"role": "user", "content": user_content},
+    ]
 
 
 def _make_duplicate_attempt(genm: object, raw_text: str, parsed, kernel: str) -> dict:
@@ -646,7 +653,7 @@ async def run_async(args: argparse.Namespace) -> dict:
                 pending_attempts: list[dict] = []
                 eval_indices: list[int] = []
                 eval_kernels: list[str] = []
-                prompt_batch: list[str] = []
+                prompt_batch: list[list[dict[str, str]]] = []
                 temp_batch: list[float] = []
                 parent_attempt_ids: list[int | None] = []
 

@@ -11,6 +11,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Sequence
 
+ChatMessage = dict[str, str]
+PromptInput = str | list[ChatMessage]
+
 
 @dataclass
 class GenMetrics:
@@ -76,10 +79,10 @@ class KevinModalOpenAI:
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Invalid JSON from Modal LLM endpoint: {raw[:800]}") from e
 
-    def generate(self, prompt: str, max_new_tokens: int = 16384, temperature: float = 0.9) -> tuple[str, GenMetrics]:
+    def generate(self, prompt: PromptInput, max_new_tokens: int = 16384, temperature: float = 0.9) -> tuple[str, GenMetrics]:
         payload = {
             "model": self.model_id,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": self._to_messages(prompt),
             "temperature": temperature,
             "max_tokens": max_new_tokens,
             "stream": False,
@@ -110,7 +113,7 @@ class KevinModalOpenAI:
 
     def generate_many(
         self,
-        prompts: list[str],
+        prompts: list[PromptInput],
         max_new_tokens: int = 16384,
         temperature: float = 0.9,
         temperatures: Sequence[float] | None = None,
@@ -151,3 +154,8 @@ def create_model(
         timeout_s=modal_llm_timeout_s,
         max_parallel_requests=modal_llm_max_parallel_requests,
     )
+    @staticmethod
+    def _to_messages(prompt: PromptInput) -> list[ChatMessage]:
+        if isinstance(prompt, str):
+            return [{"role": "user", "content": prompt}]
+        return prompt
