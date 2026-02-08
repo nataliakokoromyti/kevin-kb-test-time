@@ -178,7 +178,7 @@ def _puct_select_state(states: list[dict], exploration_coeff: float, total_expan
 
     sorted_indices = sorted(
         range(len(states)),
-        key=lambda i: float(states[i].get("best_speedup", 0.0)),
+        key=lambda i: float(states[i].get("best_score", 0.0)),
         reverse=True,
     )
     rank_prior: dict[int, float] = {}
@@ -218,7 +218,7 @@ def _puct_select_batch_states(
     while len(selected) < min(batch_size, len(states)):
         sorted_indices = sorted(
             range(len(states)),
-            key=lambda i: float(states[i].get("best_speedup", 0.0)),
+            key=lambda i: float(states[i].get("best_score", 0.0)),
             reverse=True,
         )
         rank_prior: dict[int, float] = {}
