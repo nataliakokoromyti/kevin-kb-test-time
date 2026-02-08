@@ -460,12 +460,18 @@ def _parent_attempt_id_from_history(history: list[dict]) -> int | None:
 
 def _compute_best_attempt(attempts: list[dict]) -> dict | None:
     best = None
+    best_score = float("-inf")
+    best_speedup = float("-inf")
     for a in attempts:
         ev = a.get("eval", {})
         if not ev.get("correctness"):
             continue
-        if best is None or ev.get("speedup_vs_ref", -1.0) > best["eval"].get("speedup_vs_ref", -1.0):
+        score = _kevin_score(ev)
+        speedup = float(ev.get("speedup_vs_ref", -1.0))
+        if best is None or score > best_score or (score == best_score and speedup > best_speedup):
             best = a
+            best_score = score
+            best_speedup = speedup
     return best
 
 
