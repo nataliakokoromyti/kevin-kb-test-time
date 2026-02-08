@@ -79,6 +79,8 @@ The next-turn prompt carries summary + categorized evaluator feedback (format/co
 - `--modal-timeout-s`: timeout for each Modal evaluation
 - `--cache-results` / `--no-cache-results`: LRU cache for duplicate kernels
 - `--max-new-tokens`: use high values (recommended `16384`; minimum `8192`), otherwise Kevin generations get truncated
+- `--save-intermediate` / `--no-save-intermediate`: save beam-search checkpoints to `results/checkpoints/<run_id>/`
+- `--run-id`: optional stable id for checkpoint folder naming
 
 ## Notes
 

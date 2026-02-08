@@ -361,6 +361,87 @@ def _parent_attempt_id_from_history(history: list[dict]) -> int | None:
     return None
 
 
+def _compute_best_attempt(attempts: list[dict]) -> dict | None:
+    best = None
+    for a in attempts:
+        ev = a.get("eval", {})
+        if not ev.get("correctness"):
+            continue
+        if best is None or ev.get("speedup_vs_ref", -1.0) > best["eval"].get("speedup_vs_ref", -1.0):
+            best = a
+    return best
+
+
+def _build_search_graph(attempts: list[dict]) -> tuple[list[dict], list[dict]]:
+    graph_nodes = []
+    graph_edges = []
+    for a in attempts:
+        attempt_id = a.get("attempt_id")
+        parent_attempt_id = a.get("parent_attempt_id")
+        ev = a.get("eval", {})
+        if isinstance(attempt_id, int):
+            graph_nodes.append(
+                {
+                    "attempt_id": attempt_id,
+                    "parent_attempt_id": parent_attempt_id,
+                    "trajectory_id": a.get("trajectory_id"),
+                    "parent_trajectory_id": a.get("parent_trajectory_id"),
+                    "round": a.get("round"),
+                    "trajectory_step": a.get("trajectory_step"),
+                    "correctness": bool(ev.get("correctness", False)),
+                    "speedup_vs_ref": float(ev.get("speedup_vs_ref", -1.0)),
+                    "score": _kevin_score(ev),
+                    "duplicate_kernel": bool(a.get("duplicate_kernel", False)),
+                }
+            )
+        if isinstance(attempt_id, int) and isinstance(parent_attempt_id, int):
+            graph_edges.append({"from_attempt_id": parent_attempt_id, "to_attempt_id": attempt_id})
+    return graph_nodes, graph_edges
+
+
+def _make_result_payload(
+    *,
+    args: argparse.Namespace,
+    problem_name: str,
+    attempts: list[dict],
+    settings: dict,
+    progress: dict | None = None,
+) -> dict:
+    best = _compute_best_attempt(attempts)
+    graph_nodes, graph_edges = _build_search_graph(attempts)
+    payload = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "model_id": args.model_id,
+        "technique": args.technique,
+        "problem": {"level": args.level, "problem_id": args.problem_id, "name": problem_name},
+        "settings": settings,
+        "attempts": attempts,
+        "search_graph": {
+            "nodes": graph_nodes,
+            "edges": graph_edges,
+        },
+        "best": best,
+    }
+    if progress is not None:
+        payload["progress"] = progress
+    return payload
+
+
+def _write_json_atomic(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _write_intermediate_result(args: argparse.Namespace, run_id: str, label: str, payload: dict) -> str:
+    checkpoint_dir = os.path.join(args.results_dir, "checkpoints", run_id)
+    checkpoint_path = os.path.join(checkpoint_dir, f"{label}.json")
+    _write_json_atomic(checkpoint_path, payload)
+    return checkpoint_path
+
+
 def run(args: argparse.Namespace) -> dict:
     problem_name, ref_arch_src = get_problem(
         level=args.level,
@@ -387,6 +468,44 @@ def run(args: argparse.Namespace) -> dict:
     )
     attempts: list[dict] = []
     next_attempt_id = 1
+    run_id = getattr(args, "run_id", None) or datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    settings = {
+        "dataset_source": args.dataset_source,
+        "dataset_name": args.dataset_name,
+        "kb_base_path": args.kb_base_path,
+        "device": args.device,
+        "num_correct_trials": args.num_correct_trials,
+        "num_perf_trials": args.num_perf_trials,
+        "precision": args.precision,
+        "backend": args.backend,
+        "prompt_option": args.prompt_option,
+        "max_new_tokens": args.max_new_tokens,
+        "temperature": args.temperature,
+        "n_samples": args.n_samples,
+        "turns": args.turns,
+        "num_beams": args.num_beams,
+        "beam_width": args.beam_width,
+        "steps_per_round": args.steps_per_round,
+        "num_rounds": args.num_rounds,
+        "beam_temperature": args.beam_temperature,
+        "beam_temp_jitter": args.beam_temp_jitter,
+        "beam_min_temperature": args.beam_min_temperature,
+        "beam_max_temperature": args.beam_max_temperature,
+        "include_think": args.include_think,
+        "eval_timeout_s": args.eval_timeout_s,
+        "cache_results": args.cache_results,
+        "use_modal": True,
+        "modal_gpu": args.modal_gpu,
+        "modal_timeout_s": args.modal_timeout_s,
+        "model_backend": args.model_backend,
+        "modal_llm_base_url": args.modal_llm_base_url,
+        "modal_llm_timeout_s": args.modal_llm_timeout_s,
+        "modal_llm_max_parallel_requests": args.modal_llm_max_parallel_requests,
+        "early_stop_on_correct": args.early_stop_on_correct,
+        "speedup_threshold": args.speedup_threshold,
+        "save_intermediate": args.save_intermediate,
+        "run_id": run_id,
+    }
 
     if args.technique == "greedy":
         prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
@@ -543,6 +662,46 @@ def run(args: argparse.Namespace) -> dict:
                         if score > traj["best_score"]:
                             traj["best_score"] = score
 
+                step_best = _compute_best_attempt(attempts)
+                step_best_speedup = -1.0
+                if step_best is not None:
+                    step_best_speedup = float(step_best.get("eval", {}).get("speedup_vs_ref", -1.0))
+                print(
+                    f"[beam] round={round_idx}/{args.num_rounds} step={step_idx + 1}/{args.steps_per_round} "
+                    f"attempts={len(attempts)} best_speedup={step_best_speedup:.2f}x"
+                )
+                if args.save_intermediate:
+                    progress = {
+                        "status": "in_progress",
+                        "round": round_idx,
+                        "step": step_idx + 1,
+                        "attempts_total": len(attempts),
+                        "best_speedup_vs_ref": step_best_speedup,
+                        "trajectories": [
+                            {
+                                "trajectory_id": t["trajectory_id"],
+                                "parent_trajectory_id": t.get("parent_trajectory_id"),
+                                "history_len": len(t["history"]),
+                                "best_speedup": t["best_speedup"],
+                                "best_score": t["best_score"],
+                            }
+                            for t in trajectories
+                        ],
+                    }
+                    checkpoint_payload = _make_result_payload(
+                        args=args,
+                        problem_name=problem_name,
+                        attempts=attempts,
+                        settings=settings,
+                        progress=progress,
+                    )
+                    _write_intermediate_result(
+                        args,
+                        run_id,
+                        f"round_{round_idx:02d}_step_{step_idx + 1:02d}",
+                        checkpoint_payload,
+                    )
+
             if round_idx >= args.num_rounds:
                 continue
 
@@ -579,88 +738,36 @@ def run(args: argparse.Namespace) -> dict:
                     )
                     new_trajectory_id += 1
             trajectories = expanded
+            if args.save_intermediate:
+                round_best = _compute_best_attempt(attempts)
+                round_best_speedup = -1.0
+                if round_best is not None:
+                    round_best_speedup = float(round_best.get("eval", {}).get("speedup_vs_ref", -1.0))
+                progress = {
+                    "status": "in_progress",
+                    "round": round_idx,
+                    "event": "after_prune_expand",
+                    "attempts_total": len(attempts),
+                    "best_speedup_vs_ref": round_best_speedup,
+                    "survivor_trajectory_ids": [s["trajectory_id"] for s in survivors],
+                    "next_trajectory_ids": [t["trajectory_id"] for t in trajectories],
+                }
+                checkpoint_payload = _make_result_payload(
+                    args=args,
+                    problem_name=problem_name,
+                    attempts=attempts,
+                    settings=settings,
+                    progress=progress,
+                )
+                _write_intermediate_result(args, run_id, f"round_{round_idx:02d}_post_prune", checkpoint_payload)
     else:
         raise ValueError(f"Unknown technique: {args.technique}")
-
-    best = None
-    for a in attempts:
-        ev = a.get("eval", {})
-        if not ev.get("correctness"):
-            continue
-        if best is None or ev.get("speedup_vs_ref", -1.0) > best["eval"].get("speedup_vs_ref", -1.0):
-            best = a
-
-    graph_nodes = []
-    graph_edges = []
-    for a in attempts:
-        attempt_id = a.get("attempt_id")
-        parent_attempt_id = a.get("parent_attempt_id")
-        ev = a.get("eval", {})
-        if isinstance(attempt_id, int):
-            graph_nodes.append(
-                {
-                    "attempt_id": attempt_id,
-                    "parent_attempt_id": parent_attempt_id,
-                    "trajectory_id": a.get("trajectory_id"),
-                    "parent_trajectory_id": a.get("parent_trajectory_id"),
-                    "round": a.get("round"),
-                    "trajectory_step": a.get("trajectory_step"),
-                    "correctness": bool(ev.get("correctness", False)),
-                    "speedup_vs_ref": float(ev.get("speedup_vs_ref", -1.0)),
-                    "score": _kevin_score(ev),
-                    "duplicate_kernel": bool(a.get("duplicate_kernel", False)),
-                }
-            )
-        if isinstance(attempt_id, int) and isinstance(parent_attempt_id, int):
-            graph_edges.append({"from_attempt_id": parent_attempt_id, "to_attempt_id": attempt_id})
-
-    return {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "model_id": args.model_id,
-        "technique": args.technique,
-        "problem": {"level": args.level, "problem_id": args.problem_id, "name": problem_name},
-        "settings": {
-            "dataset_source": args.dataset_source,
-            "dataset_name": args.dataset_name,
-            "kb_base_path": args.kb_base_path,
-            "device": args.device,
-            "num_correct_trials": args.num_correct_trials,
-            "num_perf_trials": args.num_perf_trials,
-            "precision": args.precision,
-            "backend": args.backend,
-            "prompt_option": args.prompt_option,
-            "max_new_tokens": args.max_new_tokens,
-            "temperature": args.temperature,
-            "n_samples": args.n_samples,
-            "turns": args.turns,
-            "num_beams": args.num_beams,
-            "beam_width": args.beam_width,
-            "steps_per_round": args.steps_per_round,
-            "num_rounds": args.num_rounds,
-            "beam_temperature": args.beam_temperature,
-            "beam_temp_jitter": args.beam_temp_jitter,
-            "beam_min_temperature": args.beam_min_temperature,
-            "beam_max_temperature": args.beam_max_temperature,
-            "include_think": args.include_think,
-            "eval_timeout_s": args.eval_timeout_s,
-            "cache_results": args.cache_results,
-            "use_modal": True,
-            "modal_gpu": args.modal_gpu,
-            "modal_timeout_s": args.modal_timeout_s,
-            "model_backend": args.model_backend,
-            "modal_llm_base_url": args.modal_llm_base_url,
-            "modal_llm_timeout_s": args.modal_llm_timeout_s,
-            "modal_llm_max_parallel_requests": args.modal_llm_max_parallel_requests,
-            "early_stop_on_correct": args.early_stop_on_correct,
-            "speedup_threshold": args.speedup_threshold,
-        },
-        "attempts": attempts,
-        "search_graph": {
-            "nodes": graph_nodes,
-            "edges": graph_edges,
-        },
-        "best": best,
-    }
+    return _make_result_payload(
+        args=args,
+        problem_name=problem_name,
+        attempts=attempts,
+        settings=settings,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -703,6 +810,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--modal-timeout-s", type=float, default=120.0)
     p.add_argument("--early-stop-on-correct", action="store_true", default=False)
     p.add_argument("--speedup-threshold", type=float, default=None)
+    p.add_argument("--save-intermediate", action="store_true", default=True)
+    p.add_argument("--no-save-intermediate", dest="save_intermediate", action="store_false")
+    p.add_argument("--run-id", default=None)
     p.add_argument("--results-dir", default="results")
     return p.parse_args()
 
