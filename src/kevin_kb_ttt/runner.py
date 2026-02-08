@@ -24,6 +24,7 @@ from .model import create_model
 MAX_KERNEL_HISTORY_LEN = 8000
 MAX_SUMMARY_CHARS = 800
 KEVIN_CORRECTNESS_BONUS = 0.3
+APPROX_CHARS_PER_TOKEN = 4
 
 
 STRUCTURED_SYSTEM_WITH_THINK = """You are an expert GPU kernel developer. Optimize the given PyTorch reference with a custom {backend} kernel.
@@ -161,60 +162,117 @@ def _build_initial_prompt(base_prompt: str, backend: str, include_think: bool) -
     ]
 
 
+def _approx_token_count(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(text) // APPROX_CHARS_PER_TOKEN)
+
+
+def _approx_message_tokens(messages: list[dict[str, str]]) -> int:
+    return sum(_approx_token_count(m.get("content", "")) for m in messages)
+
+
+def _warn_prompt_size_if_needed(
+    *,
+    messages: list[dict[str, str]],
+    warning_tokens: int,
+    context_label: str,
+) -> None:
+    prompt_tokens = _approx_message_tokens(messages)
+    if prompt_tokens >= warning_tokens:
+        print(
+            f"[prompt] warning {context_label}: approx_prompt_tokens={prompt_tokens} "
+            f"(threshold={warning_tokens})"
+        )
+
+
 def _build_refinement_prompt(
     base_prompt: str,
     backend: str,
     include_think: bool,
     history: list[dict],
+    max_prompt_tokens: int | None = None,
+    trim_history: bool = True,
+    warning_tokens: int | None = None,
+    context_label: str | None = None,
 ) -> list[dict[str, str]]:
     if not history:
-        return _build_initial_prompt(base_prompt, backend, include_think)
-
-    blocks: list[str] = []
-    latest_error_category = "success"
-    for idx, entry in enumerate(history, start=1):
-        eval_result = entry.get("eval", {})
-        error_category = categorize_error(eval_result)
-        latest_error_category = error_category
-        speedup = eval_result.get("speedup_vs_ref")
-        speedup_line = ""
-        if isinstance(speedup, (int, float)) and speedup >= 0:
-            speedup_line = f"- Speedup: {speedup:.2f}x"
-
-        err_msg = eval_result.get("error_message")
-        err_text = extract_key_error(err_msg)
-        error_section = ""
-        if err_text and error_category != "success":
-            error_section = f"Error Details:\n```\n{err_text}\n```"
-
-        summary = entry.get("summary") or _fallback_summary(eval_result, error_category)
-        summary = _truncate_summary(summary)
-
-        blocks.append(
-            ATTEMPT_BLOCK_TEMPLATE.format(
-                turn=idx,
-                error_category=_error_category_display(error_category),
-                compiled="Yes" if eval_result.get("compiled") else "No",
-                tests_passed=eval_result.get("tests_passed", 0),
-                tests_total=eval_result.get("tests_total", 0),
-                speedup_line=speedup_line,
-                summary=summary,
-                kernel=_truncate_kernel(entry.get("kernel", "")),
-                error_section=error_section,
+        messages = _build_initial_prompt(base_prompt, backend, include_think)
+        if warning_tokens is not None:
+            _warn_prompt_size_if_needed(
+                messages=messages,
+                warning_tokens=warning_tokens,
+                context_label=context_label or "initial",
             )
+        return messages
+
+    def _render_messages(selected_history: list[dict]) -> list[dict[str, str]]:
+        blocks: list[str] = []
+        latest_error_category = "success"
+        for idx, entry in enumerate(selected_history, start=1):
+            eval_result = entry.get("eval", {})
+            error_category = categorize_error(eval_result)
+            latest_error_category = error_category
+            speedup = eval_result.get("speedup_vs_ref")
+            speedup_line = ""
+            if isinstance(speedup, (int, float)) and speedup >= 0:
+                speedup_line = f"- Speedup: {speedup:.2f}x"
+
+            err_msg = eval_result.get("error_message")
+            err_text = extract_key_error(err_msg)
+            error_section = ""
+            if err_text and error_category != "success":
+                error_section = f"Error Details:\n```\n{err_text}\n```"
+
+            summary = entry.get("summary") or _fallback_summary(eval_result, error_category)
+            summary = _truncate_summary(summary)
+
+            blocks.append(
+                ATTEMPT_BLOCK_TEMPLATE.format(
+                    turn=idx,
+                    error_category=_error_category_display(error_category),
+                    compiled="Yes" if eval_result.get("compiled") else "No",
+                    tests_passed=eval_result.get("tests_passed", 0),
+                    tests_total=eval_result.get("tests_total", 0),
+                    speedup_line=speedup_line,
+                    summary=summary,
+                    kernel=_truncate_kernel(entry.get("kernel", "")),
+                    error_section=error_section,
+                )
+            )
+
+        refinement = REFINEMENT_TEMPLATE.format(
+            history_block="\n".join(blocks),
+            latest_guidance=get_error_guidance(latest_error_category, backend),
         )
+        system = STRUCTURED_SYSTEM_WITH_THINK if include_think else STRUCTURED_SYSTEM_NO_THINK
+        user_content = base_prompt + "\n\n" + refinement
+        return [
+            {"role": "system", "content": system.format(backend=backend.upper())},
+            {"role": "user", "content": user_content},
+        ]
 
-    refinement = REFINEMENT_TEMPLATE.format(
-        history_block="\n".join(blocks),
-        latest_guidance=get_error_guidance(latest_error_category, backend),
-    )
-
-    system = STRUCTURED_SYSTEM_WITH_THINK if include_think else STRUCTURED_SYSTEM_NO_THINK
-    user_content = base_prompt + "\n\n" + refinement
-    return [
-        {"role": "system", "content": system.format(backend=backend.upper())},
-        {"role": "user", "content": user_content},
-    ]
+    selected_history = list(history)
+    dropped_entries = 0
+    messages = _render_messages(selected_history)
+    if trim_history and max_prompt_tokens is not None:
+        while len(selected_history) > 1 and _approx_message_tokens(messages) > max_prompt_tokens:
+            selected_history = selected_history[1:]
+            dropped_entries += 1
+            messages = _render_messages(selected_history)
+    if dropped_entries > 0:
+        print(
+            f"[prompt] trimmed history in {context_label or 'refinement'}: "
+            f"dropped={dropped_entries} kept={len(selected_history)} "
+            f"approx_prompt_tokens={_approx_message_tokens(messages)}"
+        )
+    if warning_tokens is not None:
+        _warn_prompt_size_if_needed(
+            messages=messages,
+            warning_tokens=warning_tokens,
+            context_label=context_label or "refinement",
+        )
+    return messages
 
 
 def _make_duplicate_attempt(genm: object, raw_text: str, parsed, kernel: str) -> dict:
@@ -544,10 +602,18 @@ async def run_async(args: argparse.Namespace) -> dict:
         "speedup_threshold": args.speedup_threshold,
         "save_intermediate": args.save_intermediate,
         "run_id": run_id,
+        "trim_history_to_fit": args.trim_history_to_fit,
+        "max_prompt_tokens": args.max_prompt_tokens,
+        "prompt_warning_tokens": args.prompt_warning_tokens,
     }
 
     if args.technique == "greedy":
         prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
+        _warn_prompt_size_if_needed(
+            messages=prompt,
+            warning_tokens=args.prompt_warning_tokens,
+            context_label="greedy",
+        )
         raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
         attempt = await _evaluate_generated_response_async(args, ref_arch_src, raw, genm, set())
         attempt["attempt_id"] = next_attempt_id
@@ -557,6 +623,11 @@ async def run_async(args: argparse.Namespace) -> dict:
 
     elif args.technique == "best_of_n":
         prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
+        _warn_prompt_size_if_needed(
+            messages=prompt,
+            warning_tokens=args.prompt_warning_tokens,
+            context_label="best_of_n",
+        )
         prompt_batch = [prompt for _ in range(args.n_samples)]
         generations = llm.generate_many(prompt_batch, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
         seen_fingerprints: set[str] = set()
@@ -599,9 +670,18 @@ async def run_async(args: argparse.Namespace) -> dict:
                     backend=args.backend,
                     include_think=args.include_think,
                     history=history,
+                    max_prompt_tokens=args.max_prompt_tokens,
+                    trim_history=args.trim_history_to_fit,
+                    warning_tokens=args.prompt_warning_tokens,
+                    context_label=f"serial_refine turn={turn_idx + 1}",
                 )
             else:
                 prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
+                _warn_prompt_size_if_needed(
+                    messages=prompt,
+                    warning_tokens=args.prompt_warning_tokens,
+                    context_label=f"serial_refine turn={turn_idx + 1}",
+                )
 
             raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
             attempt = await _evaluate_generated_response_async(args, ref_arch_src, raw, genm, seen_fingerprints)
@@ -666,9 +746,22 @@ async def run_async(args: argparse.Namespace) -> dict:
                             backend=args.backend,
                             include_think=args.include_think,
                             history=traj["history"],
+                            max_prompt_tokens=args.max_prompt_tokens,
+                            trim_history=args.trim_history_to_fit,
+                            warning_tokens=args.prompt_warning_tokens,
+                            context_label=(
+                                f"beam round={round_idx} step={step_idx + 1} traj={traj['trajectory_id']}"
+                            ),
                         )
                     else:
                         prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
+                        _warn_prompt_size_if_needed(
+                            messages=prompt,
+                            warning_tokens=args.prompt_warning_tokens,
+                            context_label=(
+                                f"beam round={round_idx} step={step_idx + 1} traj={traj['trajectory_id']}"
+                            ),
+                        )
                     prompt_batch.append(prompt)
                     temp_batch.append(float(traj["temperature"]))
 
@@ -884,6 +977,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--modal-timeout-s", type=float, default=120.0)
     p.add_argument("--early-stop-on-correct", action="store_true", default=False)
     p.add_argument("--speedup-threshold", type=float, default=None)
+    p.add_argument("--trim-history-to-fit", action="store_true", default=True)
+    p.add_argument("--no-trim-history-to-fit", dest="trim_history_to_fit", action="store_false")
+    p.add_argument("--max-prompt-tokens", type=int, default=24000)
+    p.add_argument("--prompt-warning-tokens", type=int, default=24000)
     p.add_argument("--save-intermediate", action="store_true", default=True)
     p.add_argument("--no-save-intermediate", dest="save_intermediate", action="store_false")
     p.add_argument("--run-id", default=None)

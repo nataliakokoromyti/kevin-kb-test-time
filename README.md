@@ -81,6 +81,9 @@ The next-turn prompt carries summary + categorized evaluator feedback (format/co
 - `--max-new-tokens`: use high values (recommended `16384`; minimum `8192`), otherwise Kevin generations get truncated
 - `--save-intermediate` / `--no-save-intermediate`: save beam-search checkpoints to `results/checkpoints/<run_id>/`
 - `--run-id`: optional stable id for checkpoint folder naming
+- `--trim-history-to-fit` / `--no-trim-history-to-fit`: drop oldest refinement attempts if prompt exceeds budget
+- `--max-prompt-tokens`: approximate prompt token budget (default `24000`)
+- `--prompt-warning-tokens`: print warning when prompt exceeds threshold (default `24000`)
 
 ## Notes
 
