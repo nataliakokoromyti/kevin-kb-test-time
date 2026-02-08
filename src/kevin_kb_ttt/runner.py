@@ -598,6 +598,7 @@ def _make_result_payload(
     attempts: list[dict],
     settings: dict,
     progress: dict | None = None,
+    puct_buffer: list[dict] | None = None,
 ) -> dict:
     best = _compute_best_attempt(attempts)
     graph_nodes, graph_edges = _build_search_graph(attempts)
@@ -616,7 +617,26 @@ def _make_result_payload(
     }
     if progress is not None:
         payload["progress"] = progress
+    if puct_buffer is not None:
+        payload["puct_buffer"] = puct_buffer
     return payload
+
+
+def _serialize_puct_buffer(states: list[dict]) -> list[dict]:
+    serialized: list[dict] = []
+    for state in states:
+        serialized.append(
+            {
+                "state_id": state.get("state_id"),
+                "parent_state_id": state.get("parent_state_id"),
+                "visit_count": int(state.get("visit_count", 0)),
+                "best_score": float(state.get("best_score", 0.0)),
+                "best_speedup": float(state.get("best_speedup", 0.0)),
+                "best_child_score": float(state.get("best_child_score", 0.0)),
+                "history_len": len(state.get("history", [])),
+            }
+        )
+    return serialized
 
 
 def _write_json_atomic(path: str, payload: dict) -> None:
@@ -659,6 +679,7 @@ async def run_async(args: argparse.Namespace) -> dict:
         modal_llm_max_parallel_requests=args.modal_llm_max_parallel_requests,
     )
     attempts: list[dict] = []
+    puct_buffer_output: list[dict] | None = None
     next_attempt_id = 1
     run_id = getattr(args, "run_id", None) or datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     settings = {
@@ -956,6 +977,7 @@ async def run_async(args: argparse.Namespace) -> dict:
                         attempts=attempts,
                         settings=settings,
                         progress=progress,
+                        puct_buffer=_serialize_puct_buffer(puct_states),
                     )
                     _write_intermediate_result(
                         args,
@@ -1207,6 +1229,7 @@ async def run_async(args: argparse.Namespace) -> dict:
                         attempts=attempts,
                         settings=settings,
                         progress=progress,
+                        puct_buffer=_serialize_puct_buffer(puct_states),
                     )
                     _write_intermediate_result(
                         args,
@@ -1287,6 +1310,7 @@ async def run_async(args: argparse.Namespace) -> dict:
                         attempts=attempts,
                         settings=settings,
                         progress=progress,
+                        puct_buffer=_serialize_puct_buffer(puct_states),
                     )
                     _write_intermediate_result(
                         args,
@@ -1294,6 +1318,7 @@ async def run_async(args: argparse.Namespace) -> dict:
                         f"puct_rollout_{job['rollout_index'] + 1:03d}",
                         checkpoint_payload,
                     )
+        puct_buffer_output = _serialize_puct_buffer(puct_states)
     else:
         raise ValueError(f"Unknown technique: {args.technique}")
     return _make_result_payload(
@@ -1301,6 +1326,7 @@ async def run_async(args: argparse.Namespace) -> dict:
         problem_name=problem_name,
         attempts=attempts,
         settings=settings,
+        puct_buffer=puct_buffer_output,
     )
 
 
