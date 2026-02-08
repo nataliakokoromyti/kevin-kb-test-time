@@ -19,7 +19,7 @@ from .kb_pipeline import (
 )
 from .model import create_model
 
-MAX_KERNEL_HISTORY_LEN = 2000
+MAX_KERNEL_HISTORY_LEN = 8000
 MAX_SUMMARY_CHARS = 800
 KEVIN_CORRECTNESS_BONUS = 0.3
 
@@ -75,7 +75,12 @@ Kernel:
 def _truncate_kernel(kernel_code: str, max_len: int = MAX_KERNEL_HISTORY_LEN) -> str:
     if len(kernel_code) <= max_len:
         return kernel_code
-    return kernel_code[:max_len] + "\n# ... (truncated)"
+    # Preserve both setup/signature and tail-end kernel details.
+    head_len = int(max_len * 0.6)
+    tail_len = max_len - head_len
+    head = kernel_code[:head_len]
+    tail = kernel_code[-tail_len:]
+    return head + "\n# ... (middle truncated) ...\n" + tail
 
 
 def _truncate_summary(summary: str, max_chars: int = MAX_SUMMARY_CHARS) -> str:
