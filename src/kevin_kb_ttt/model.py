@@ -32,7 +32,7 @@ class KevinHF:
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
             trust_remote_code=True,
-            torch_dtype=dtype,
+            dtype=dtype,
             device_map="auto",
         )
 

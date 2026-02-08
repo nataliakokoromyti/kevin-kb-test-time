@@ -12,6 +12,7 @@ dependencies = [
   "torch>=2.3",
   "transformers>=4.45",
   "accelerate>=0.34",
+  "modal",
   "kernelbench @ git+https://github.com/ScalingIntelligence/KernelBench.git",
 ]
 

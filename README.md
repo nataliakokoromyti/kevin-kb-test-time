@@ -7,6 +7,9 @@ This repo avoids re-implementing KernelBench internals and uses KB directly for:
 - static reward-hacking checks (`kernelbench.kernel_static_checker`)
 - correctness + timing eval (`kernelbench.eval`)
 - dataset loading from Hugging Face (`ScalingIntelligence/KernelBench`)
+- structured multi-turn parsing (`<think>`, `<KERNEL>`, `<SUMMARY>`)
+- async eval with timeout + duplicate-kernel cache
+- Modal-only evaluation path (KB script-style)
 
 ## 1) Setup
 
@@ -17,7 +20,12 @@ py -3.10 -m venv .venv
 pip install -e .
 ```
 
-KernelBench is consumed as an installed package; no local KernelBench checkout is required.
+This repo includes KernelBench as a submodule for exact harness execution.
+Initialize submodules:
+
+```powershell
+git submodule update --init --recursive
+```
 
 ## 2) Smoke run (single problem)
 
@@ -31,14 +39,32 @@ python -m kevin_kb_ttt.runner --level 1 --problem-id 1 --technique greedy --max-
 
 ```powershell
 kevin-kb-run --level 1 --problem-id 1 --technique best_of_n --n-samples 4
-kevin-kb-run --level 1 --problem-id 1 --technique serial_refine --turns 3
-kevin-kb-run --level 1 --problem-id 1 --technique beam_search --num-beams 16 --beam-width 4 --steps-per-round 4 --num-rounds 2 --beam-temperature 0.9
+kevin-kb-run --level 1 --problem-id 1 --technique serial_refine --turns 3 --modal-gpu L40S --modal-timeout-s 120 --cache-results
+kevin-kb-run --level 1 --problem-id 1 --technique beam_search --num-beams 16 --beam-width 4 --steps-per-round 4 --num-rounds 2 --beam-temperature 0.9 --modal-gpu L40S --modal-timeout-s 120 --cache-results
 ```
 
 Results are written to `results/*.json`.
 
+## Structured Output Contract
+
+For multi-turn refinement and beam search, the runner instructs the model to emit:
+
+- `<think>...</think>` (optional; enabled with `--include-think`)
+- `<KERNEL>```python ... ```</KERNEL>` (required)
+- `<SUMMARY>...</SUMMARY>` (used as compressed carry-over between turns)
+
+The next-turn prompt carries summary + categorized evaluator feedback (format/compile/runtime/correctness/perf), not raw CoT.
+
+## Eval Controls
+
+- Modal is the only supported eval mode.
+- Eval is executed through exact KB harness script: `third_party/KernelBench/scripts/run_and_check.py`
+- `--modal-gpu`: target Modal GPU (for example `L40S`, `H100`, `A100`)
+- `--modal-timeout-s`: timeout for each Modal evaluation
+- `--cache-results` / `--no-cache-results`: LRU cache for duplicate kernels
+
 ## Notes
 
 - Default model id: `cognition-ai/Kevin-32B`
-- You need a CUDA-capable environment to run local timing eval.
+- Set up Modal auth before running: `modal token new`
 - If you choose `--dataset-source local`, pass `--kb-base-path` explicitly.

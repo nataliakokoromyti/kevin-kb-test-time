@@ -16,3 +16,8 @@ beam_width: 4
 steps_per_round: 4
 num_rounds: 2
 beam_temperature: 0.9
+include_think: false
+eval_timeout_s: 120
+cache_results: true
+modal_gpu: L40S
+modal_timeout_s: 120
