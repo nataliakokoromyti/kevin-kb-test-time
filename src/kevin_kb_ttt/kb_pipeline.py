@@ -310,6 +310,15 @@ def _run_kb_modal_harness(
     if proc.returncode != 0:
         err = _extract_key_error_from_text(output) or f"KB harness exited with code {proc.returncode}"
 
+    cheated = False
+    if excessive_speedup:
+        cheated = True
+        correctness = False
+        speedup = -1.0
+        runtime_us = -1.0
+        if not err:
+            err = "KernelBench flagged excessive speedup; treated as invalid/reward-hacked result."
+
     return {
         "format_ok": True,
         "compiled": bool(compiled) if compiled is not None else False,
@@ -319,7 +328,7 @@ def _run_kb_modal_harness(
         "speedup_vs_ref": float(speedup),
         "runtime_us": float(runtime_us),
         "ref_runtime_us": float(ref_runtime_us),
-        "cheated": False,
+        "cheated": cheated,
         "error_message": err,
         "code_length": len(kernel_code),
         "metadata": {
@@ -327,6 +336,7 @@ def _run_kb_modal_harness(
             "modal_gpu": modal_gpu,
             "returncode": proc.returncode,
             "excessive_speedup": excessive_speedup,
+            "reward_hacking_detected": cheated,
             "stdout_tail": (proc.stdout or "")[-4000:],
             "stderr_tail": (proc.stderr or "")[-4000:],
             "timings": {"total_eval_s": time.perf_counter() - t0},
