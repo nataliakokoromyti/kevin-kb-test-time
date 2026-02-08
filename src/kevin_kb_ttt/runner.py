@@ -343,12 +343,22 @@ def _apply_attempt_to_history(history: list[dict], attempt: dict) -> None:
 
     history.append(
         {
+            "attempt_id": attempt.get("attempt_id"),
             "kernel": attempt.get("kernel", ""),
             "summary": _truncate_summary(carry_summary),
             "eval": attempt.get("eval", {}),
             "kernel_fingerprint": attempt.get("kernel_fingerprint"),
         }
     )
+
+
+def _parent_attempt_id_from_history(history: list[dict]) -> int | None:
+    if not history:
+        return None
+    parent_id = history[-1].get("attempt_id")
+    if isinstance(parent_id, int):
+        return parent_id
+    return None
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -376,11 +386,16 @@ def run(args: argparse.Namespace) -> dict:
         modal_llm_max_parallel_requests=args.modal_llm_max_parallel_requests,
     )
     attempts: list[dict] = []
+    next_attempt_id = 1
 
     if args.technique == "greedy":
         prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
         raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
-        attempts.append(_evaluate_generated_response(args, ref_arch_src, raw, genm, set()))
+        attempt = _evaluate_generated_response(args, ref_arch_src, raw, genm, set())
+        attempt["attempt_id"] = next_attempt_id
+        next_attempt_id += 1
+        attempt["parent_attempt_id"] = None
+        attempts.append(attempt)
 
     elif args.technique == "best_of_n":
         prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
@@ -389,6 +404,9 @@ def run(args: argparse.Namespace) -> dict:
         seen_fingerprints: set[str] = set()
         for raw, genm in generations:
             attempt = _evaluate_generated_response(args, ref_arch_src, raw, genm, seen_fingerprints)
+            attempt["attempt_id"] = next_attempt_id
+            next_attempt_id += 1
+            attempt["parent_attempt_id"] = None
             attempts.append(attempt)
             fp = attempt.get("kernel_fingerprint")
             if fp:
@@ -398,6 +416,7 @@ def run(args: argparse.Namespace) -> dict:
         history: list[dict] = []
         seen_fingerprints: set[str] = set()
         for turn_idx in range(args.turns):
+            parent_attempt_id = _parent_attempt_id_from_history(history)
             if history:
                 prompt = _build_refinement_prompt(
                     base_prompt=base_prompt,
@@ -410,6 +429,9 @@ def run(args: argparse.Namespace) -> dict:
 
             raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
             attempt = _evaluate_generated_response(args, ref_arch_src, raw, genm, seen_fingerprints)
+            attempt["attempt_id"] = next_attempt_id
+            next_attempt_id += 1
+            attempt["parent_attempt_id"] = parent_attempt_id
             attempts.append(attempt)
             fp = attempt.get("kernel_fingerprint")
             if fp:
@@ -446,6 +468,7 @@ def run(args: argparse.Namespace) -> dict:
                     "best_score": 0.0,
                     "seen_fingerprints": set(),
                     "temperature": round1_temps[beam_idx],
+                    "parent_trajectory_id": None,
                 }
             )
 
@@ -456,6 +479,7 @@ def run(args: argparse.Namespace) -> dict:
                 eval_kernels: list[str] = []
 
                 for traj in trajectories:
+                    parent_attempt_id = _parent_attempt_id_from_history(traj["history"])
                     if traj["history"]:
                         prompt = _build_refinement_prompt(
                             base_prompt=base_prompt,
@@ -479,12 +503,16 @@ def run(args: argparse.Namespace) -> dict:
                     )
                     attempt.update(
                         {
+                            "attempt_id": next_attempt_id,
+                            "parent_attempt_id": parent_attempt_id,
                             "round": round_idx,
                             "trajectory_id": traj["trajectory_id"],
+                            "parent_trajectory_id": traj.get("parent_trajectory_id"),
                             "trajectory_step": step_idx + 1,
                             "generation_temperature": traj["temperature"],
                         }
                     )
+                    next_attempt_id += 1
                     pending_attempts.append({"trajectory": traj, "attempt": attempt})
                     if kernel_for_eval is not None:
                         eval_indices.append(len(pending_attempts) - 1)
@@ -546,6 +574,7 @@ def run(args: argparse.Namespace) -> dict:
                             "best_score": survivor["best_score"],
                             "seen_fingerprints": set(survivor["seen_fingerprints"]),
                             "temperature": t,
+                            "parent_trajectory_id": survivor["trajectory_id"],
                         }
                     )
                     new_trajectory_id += 1
@@ -560,6 +589,30 @@ def run(args: argparse.Namespace) -> dict:
             continue
         if best is None or ev.get("speedup_vs_ref", -1.0) > best["eval"].get("speedup_vs_ref", -1.0):
             best = a
+
+    graph_nodes = []
+    graph_edges = []
+    for a in attempts:
+        attempt_id = a.get("attempt_id")
+        parent_attempt_id = a.get("parent_attempt_id")
+        ev = a.get("eval", {})
+        if isinstance(attempt_id, int):
+            graph_nodes.append(
+                {
+                    "attempt_id": attempt_id,
+                    "parent_attempt_id": parent_attempt_id,
+                    "trajectory_id": a.get("trajectory_id"),
+                    "parent_trajectory_id": a.get("parent_trajectory_id"),
+                    "round": a.get("round"),
+                    "trajectory_step": a.get("trajectory_step"),
+                    "correctness": bool(ev.get("correctness", False)),
+                    "speedup_vs_ref": float(ev.get("speedup_vs_ref", -1.0)),
+                    "score": _kevin_score(ev),
+                    "duplicate_kernel": bool(a.get("duplicate_kernel", False)),
+                }
+            )
+        if isinstance(attempt_id, int) and isinstance(parent_attempt_id, int):
+            graph_edges.append({"from_attempt_id": parent_attempt_id, "to_attempt_id": attempt_id})
 
     return {
         "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -602,6 +655,10 @@ def run(args: argparse.Namespace) -> dict:
             "speedup_threshold": args.speedup_threshold,
         },
         "attempts": attempts,
+        "search_graph": {
+            "nodes": graph_nodes,
+            "edges": graph_edges,
+        },
         "best": best,
     }
 
