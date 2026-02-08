@@ -521,15 +521,31 @@ def run(args: argparse.Namespace) -> dict:
         prompt_batch = [prompt for _ in range(args.n_samples)]
         generations = llm.generate_many(prompt_batch, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
         seen_fingerprints: set[str] = set()
+        pending_attempts: list[dict] = []
+        eval_indices: list[int] = []
+        eval_kernels: list[str] = []
+
         for raw, genm in generations:
-            attempt = _evaluate_generated_response(args, ref_arch_src, raw, genm, seen_fingerprints)
+            attempt, kernel_for_eval = _prepare_generated_attempt(args, raw, genm, seen_fingerprints)
             attempt["attempt_id"] = next_attempt_id
             next_attempt_id += 1
             attempt["parent_attempt_id"] = None
-            attempts.append(attempt)
+
+            pending_attempts.append(attempt)
+            if kernel_for_eval is not None:
+                eval_indices.append(len(pending_attempts) - 1)
+                eval_kernels.append(kernel_for_eval)
+
             fp = attempt.get("kernel_fingerprint")
             if fp:
                 seen_fingerprints.add(fp)
+
+        if eval_kernels:
+            eval_results = asyncio.run(_evaluate_kernels_batch_async(args, ref_arch_src, eval_kernels))
+            for pending_idx, eval_result in zip(eval_indices, eval_results):
+                pending_attempts[pending_idx]["eval"] = eval_result
+
+        attempts.extend(pending_attempts)
 
     elif args.technique == "serial_refine":
         history: list[dict] = []
