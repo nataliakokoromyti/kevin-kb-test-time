@@ -17,6 +17,7 @@ from .kb_pipeline import (
     get_error_guidance,
     get_problem,
     parse_structured_response,
+    static_check,
 )
 from .model import create_model
 
@@ -283,14 +284,34 @@ def _prepare_generated_attempt(
         attempt["kernel_fingerprint"] = kernel_fp
         return attempt, None
 
+    static_ok, static_err, static_warnings = static_check(
+        kernel,
+        backend=args.backend,
+        precision=args.precision,
+    )
+    if not static_ok:
+        return {
+            "generation": asdict(genm),
+            "raw": raw_text,
+            "thought": parsed.thought,
+            "summary": parsed.thought_summary,
+            "kernel": kernel,
+            "static_check_ok": False,
+            "static_error": static_err or "static_check_failed",
+            "static_warnings": static_warnings,
+            "duplicate_kernel": False,
+            "kernel_fingerprint": kernel_fp,
+            "eval": _make_failed_eval(True, static_err or "Static check failed", len(kernel)),
+        }, None
+
     attempt = {
         "generation": asdict(genm),
         "raw": raw_text,
         "thought": parsed.thought,
         "summary": parsed.thought_summary,
         "kernel": kernel,
-        "static_check_ok": None,
-        "static_warnings": [],
+        "static_check_ok": True,
+        "static_warnings": static_warnings,
         "duplicate_kernel": False,
         "kernel_fingerprint": kernel_fp,
     }
