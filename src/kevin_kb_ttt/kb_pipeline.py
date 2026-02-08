@@ -25,16 +25,8 @@ THINKING_PATTERN = re.compile(
     r"<(?:think|thinking|THOUGHT)>(.*?)</(?:think|thinking|THOUGHT)>",
     re.DOTALL | re.IGNORECASE,
 )
-KERNEL_BLOCK_PATTERN = re.compile(
-    r"<KERNEL>\s*```(?:cuda|python|cpp)?\s*\n?(.*?)```\s*</KERNEL>",
-    re.DOTALL | re.IGNORECASE,
-)
-KERNEL_BLOCK_SIMPLE_PATTERN = re.compile(
-    r"<KERNEL>(.*?)</KERNEL>",
-    re.DOTALL | re.IGNORECASE,
-)
-SUMMARY_BLOCK_PATTERN = re.compile(
-    r"<SUMMARY>(.*?)</SUMMARY>",
+CODE_FENCE_PATTERN = re.compile(
+    r"```(?:cuda|python|cpp)?\s*\n.*?```",
     re.DOTALL | re.IGNORECASE,
 )
 
@@ -141,44 +133,15 @@ def parse_structured_response(text: str) -> ParsedResponse:
         thought = think_match.group(1).strip()
         text = THINKING_PATTERN.sub("", text).strip()
 
-    summary_match = SUMMARY_BLOCK_PATTERN.search(text)
-    if summary_match:
-        thought_summary = summary_match.group(1).strip()
-        text = SUMMARY_BLOCK_PATTERN.sub("", text).strip()
+    kernel = extract_first_code(text, ["python", "cpp"]) or ""
 
-    kernel_match = KERNEL_BLOCK_PATTERN.search(text)
-    if kernel_match:
-        kernel = kernel_match.group(1).strip()
+    # Kevin/QwQ-native summary extraction: use plain text after the last code block.
+    text_wo_think = THINKING_PATTERN.sub("", raw).strip()
+    fences = list(CODE_FENCE_PATTERN.finditer(text_wo_think))
+    if fences:
+        thought_summary = text_wo_think[fences[-1].end() :].strip()
     else:
-        kernel_match = KERNEL_BLOCK_SIMPLE_PATTERN.search(text)
-        if kernel_match:
-            inner = kernel_match.group(1).strip()
-            kernel = extract_first_code(inner, ["python", "cpp"]) or inner
-
-    if not kernel:
-        kernel = extract_first_code(text, ["python", "cpp"]) or ""
-
-    # Fallback summary extraction for Kevin/QwQ-native format:
-    # if no <SUMMARY> tag is present, use plain text after the code block.
-    if not thought_summary:
-        text_wo_think = THINKING_PATTERN.sub("", raw).strip()
-        code_fence_pattern = re.compile(
-            r"```(?:cuda|python|cpp)?\s*\n.*?```",
-            re.DOTALL | re.IGNORECASE,
-        )
-        fences = list(code_fence_pattern.finditer(text_wo_think))
-        if fences:
-            # Use only trailing text after the last code block to avoid pulling in preambles.
-            trailing = text_wo_think[fences[-1].end() :].strip()
-            trailing = SUMMARY_BLOCK_PATTERN.sub("", trailing).strip()
-            thought_summary = trailing
-        else:
-            # Fallback when no explicit code fence exists.
-            stripped = text_wo_think
-            stripped = KERNEL_BLOCK_PATTERN.sub("", stripped).strip()
-            stripped = KERNEL_BLOCK_SIMPLE_PATTERN.sub("", stripped).strip()
-            stripped = SUMMARY_BLOCK_PATTERN.sub("", stripped).strip()
-            thought_summary = stripped
+        thought_summary = ""
 
     format_ok = bool(kernel) and ("class ModelNew" in kernel or "def forward" in kernel)
     return ParsedResponse(
