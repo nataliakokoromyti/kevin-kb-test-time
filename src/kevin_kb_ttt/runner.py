@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 from dataclasses import asdict
@@ -23,6 +24,121 @@ def _eval_feedback(summary) -> str:
     if not summary.correctness:
         return f"correctness_failed metadata={summary.metadata}"
     return f"correct speedup_vs_ref={summary.speedup_vs_ref:.4f}"
+
+
+def _eval_feedback_dict(ev: dict) -> str:
+    if not ev.get("compiled", False):
+        return f"compile_failed metadata={ev.get('metadata', {})}"
+    if not ev.get("correctness", False):
+        return f"correctness_failed metadata={ev.get('metadata', {})}"
+    return f"correct speedup_vs_ref={ev.get('speedup_vs_ref', 0.0):.4f}"
+
+
+def _history_to_prompt(base_prompt: str, history: list[dict]) -> str:
+    if not history:
+        return base_prompt
+    sections = [base_prompt, "\n\nPrevious attempts and evaluator feedback:"]
+    for idx, h in enumerate(history, start=1):
+        sections.append(
+            f"\nAttempt {idx}: correctness={h.get('correctness')} speedup={h.get('speedup', 0.0):.4f}\n"
+            f"Feedback: {h.get('feedback', '')}\n"
+            f"Kernel:\n{h.get('kernel', '')}\n"
+        )
+    sections.append("\nReturn an improved full kernel implementation only.")
+    return "".join(sections)
+
+
+def _evaluate_generated_kernel(args: argparse.Namespace, ref_arch_src: str, raw_text: str, genm: object) -> dict:
+    kernel = extract_kernel_code(raw_text)
+    ok, err, warns = static_check(kernel, backend=args.backend, precision=args.precision)
+    if not ok:
+        return {
+            "static_check_ok": False,
+            "static_error": err,
+            "static_warnings": warns,
+            "generation": asdict(genm),
+            "kernel": kernel,
+        }
+    summary = evaluate_kernel(
+        ref_arch_src,
+        kernel,
+        device=args.device,
+        num_correct_trials=args.num_correct_trials,
+        num_perf_trials=args.num_perf_trials,
+        backend=args.backend,
+        precision=args.precision,
+    )
+    return {
+        "static_check_ok": True,
+        "static_warnings": warns,
+        "generation": asdict(genm),
+        "eval": to_dict(summary),
+        "kernel": kernel,
+    }
+
+
+def _run_beam_trajectory(
+    args: argparse.Namespace,
+    llm: KevinHF,
+    ref_arch_src: str,
+    base_prompt: str,
+    history: list[dict],
+    steps: int,
+    round_idx: int,
+    trajectory_id: int,
+    attempts: list[dict],
+) -> dict:
+    local_history = copy.deepcopy(history)
+    best_kernel = None
+    best_speedup = 0.0
+
+    for h in local_history:
+        if h.get("correctness") and h.get("speedup", 0.0) > best_speedup:
+            best_speedup = h["speedup"]
+            best_kernel = h.get("kernel")
+
+    for step_idx in range(steps):
+        prompt = _history_to_prompt(base_prompt, local_history)
+        raw, genm = llm.generate(
+            prompt,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.beam_temperature,
+        )
+        result = _evaluate_generated_kernel(args, ref_arch_src, raw, genm)
+        result.update(
+            {
+                "round": round_idx,
+                "trajectory_id": trajectory_id,
+                "trajectory_step": step_idx + 1,
+            }
+        )
+        attempts.append(result)
+
+        ev = result.get("eval", {})
+        correctness = bool(ev.get("correctness", False))
+        speedup = float(ev.get("speedup_vs_ref", 0.0)) if correctness else 0.0
+        feedback = result.get("static_error") or "static_check_failed"
+        if result.get("static_check_ok") and ev:
+            feedback = _eval_feedback_dict(ev)
+
+        local_history.append(
+            {
+                "kernel": result.get("kernel", ""),
+                "feedback": feedback,
+                "speedup": speedup,
+                "correctness": correctness,
+            }
+        )
+
+        if correctness and speedup > best_speedup:
+            best_speedup = speedup
+            best_kernel = result.get("kernel")
+
+    return {
+        "best_kernel": best_kernel,
+        "best_speedup": best_speedup,
+        "history": local_history,
+    }
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -132,6 +248,49 @@ def run(args: argparse.Namespace) -> dict:
                 + feedback
                 + "\n\nReturn an improved full kernel implementation only."
             )
+    elif args.technique == "beam_search":
+        if args.beam_width > args.num_beams:
+            raise ValueError("beam_width must be <= num_beams")
+        if args.num_beams % args.beam_width != 0:
+            raise ValueError("num_beams must be divisible by beam_width")
+
+        trajectories = []
+        for beam_idx in range(args.num_beams):
+            traj = _run_beam_trajectory(
+                args=args,
+                llm=llm,
+                ref_arch_src=ref_arch_src,
+                base_prompt=base_prompt,
+                history=[],
+                steps=args.steps_per_round,
+                round_idx=1,
+                trajectory_id=beam_idx,
+                attempts=attempts,
+            )
+            trajectories.append(traj)
+
+        for round_idx in range(2, args.num_rounds + 1):
+            trajectories.sort(key=lambda t: t["best_speedup"], reverse=True)
+            survivors = trajectories[: args.beam_width]
+            expanded = []
+            clones_per_survivor = args.num_beams // args.beam_width
+            trajectory_id = 0
+            for survivor in survivors:
+                for _ in range(clones_per_survivor):
+                    traj = _run_beam_trajectory(
+                        args=args,
+                        llm=llm,
+                        ref_arch_src=ref_arch_src,
+                        base_prompt=base_prompt,
+                        history=survivor["history"],
+                        steps=args.steps_per_round,
+                        round_idx=round_idx,
+                        trajectory_id=trajectory_id,
+                        attempts=attempts,
+                    )
+                    expanded.append(traj)
+                    trajectory_id += 1
+            trajectories = expanded
     else:
         raise ValueError(f"Unknown technique: {args.technique}")
 
@@ -164,6 +323,11 @@ def run(args: argparse.Namespace) -> dict:
             "temperature": args.temperature,
             "n_samples": args.n_samples,
             "turns": args.turns,
+            "num_beams": args.num_beams,
+            "beam_width": args.beam_width,
+            "steps_per_round": args.steps_per_round,
+            "num_rounds": args.num_rounds,
+            "beam_temperature": args.beam_temperature,
         },
         "attempts": attempts,
         "best": best,
@@ -174,9 +338,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--model-id", default="cognition-ai/Kevin-32B")
     p.add_argument("--torch-dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
-    p.add_argument("--technique", default="greedy", choices=["greedy", "best_of_n", "serial_refine"])
+    p.add_argument("--technique", default="greedy", choices=["greedy", "best_of_n", "serial_refine", "beam_search"])
     p.add_argument("--n-samples", type=int, default=4)
     p.add_argument("--turns", type=int, default=3)
+    p.add_argument("--num-beams", type=int, default=16)
+    p.add_argument("--beam-width", type=int, default=4)
+    p.add_argument("--steps-per-round", type=int, default=4)
+    p.add_argument("--num-rounds", type=int, default=2)
+    p.add_argument("--beam-temperature", type=float, default=0.9)
     p.add_argument("--level", type=int, default=1)
     p.add_argument("--problem-id", type=int, required=True)
     p.add_argument("--dataset-source", default="huggingface", choices=["local", "huggingface"])

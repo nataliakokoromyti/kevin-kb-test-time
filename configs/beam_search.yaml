@@ -1,0 +1,18 @@
+# Kevin-style beam search
+model_id: cognition-ai/Kevin-32B
+technique: beam_search
+level: 1
+problem_id: 1
+dataset_source: huggingface
+num_correct_trials: 5
+num_perf_trials: 100
+precision: fp32
+backend: cuda
+prompt_option: one_shot
+max_new_tokens: 768
+temperature: 0.0
+num_beams: 16
+beam_width: 4
+steps_per_round: 4
+num_rounds: 2
+beam_temperature: 0.9

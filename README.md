@@ -32,6 +32,7 @@ python -m kevin_kb_ttt.runner --level 1 --problem-id 1 --technique greedy --max-
 ```powershell
 kevin-kb-run --level 1 --problem-id 1 --technique best_of_n --n-samples 4
 kevin-kb-run --level 1 --problem-id 1 --technique serial_refine --turns 3
+kevin-kb-run --level 1 --problem-id 1 --technique beam_search --num-beams 16 --beam-width 4 --steps-per-round 4 --num-rounds 2 --beam-temperature 0.9
 ```
 
 Results are written to `results/*.json`.
