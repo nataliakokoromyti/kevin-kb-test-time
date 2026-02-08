@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import hashlib
 import json
 import os
 from dataclasses import asdict
@@ -126,6 +127,12 @@ def _kevin_score(eval_result: dict) -> float:
     return KEVIN_CORRECTNESS_BONUS + speedup
 
 
+def _kernel_fingerprint(kernel_code: str) -> str:
+    # Normalize whitespace to detect semantically identical repeats with minor formatting changes.
+    normalized = " ".join((kernel_code or "").split())
+    return hashlib.sha1(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()
+
+
 def _beam_temperatures(
     count: int,
     base: float,
@@ -202,6 +209,33 @@ def _build_refinement_prompt(
     return system.format(backend=backend.upper()) + "\n\n" + base_prompt + "\n\n" + refinement
 
 
+def _make_duplicate_attempt(genm: object, raw_text: str, parsed, kernel: str) -> dict:
+    return {
+        "generation": asdict(genm),
+        "raw": raw_text,
+        "thought": parsed.thought,
+        "summary": parsed.thought_summary,
+        "kernel": kernel,
+        "static_check_ok": None,
+        "static_warnings": [],
+        "duplicate_kernel": True,
+        "eval": {
+            "format_ok": True,
+            "compiled": False,
+            "correctness": False,
+            "tests_passed": 0,
+            "tests_total": 0,
+            "speedup_vs_ref": -1.0,
+            "runtime_us": -1.0,
+            "ref_runtime_us": -1.0,
+            "cheated": False,
+            "error_message": "Duplicate kernel detected: identical to a previous attempt. Try a different approach.",
+            "code_length": len(kernel),
+            "metadata": {"duplicate_kernel": True},
+        },
+    }
+
+
 def _make_failed_eval(format_ok: bool, error_message: str, code_length: int) -> dict:
     return {
         "format_ok": format_ok,
@@ -222,6 +256,7 @@ def _make_failed_eval(format_ok: bool, error_message: str, code_length: int) -> 
 def _evaluate_generated_response(args: argparse.Namespace, ref_arch_src: str, raw_text: str, genm: object) -> dict:
     parsed = parse_structured_response(raw_text)
     kernel = parsed.kernel or ""
+    kernel_fp = _kernel_fingerprint(kernel)
 
     if not parsed.format_ok:
         return {
@@ -233,8 +268,15 @@ def _evaluate_generated_response(args: argparse.Namespace, ref_arch_src: str, ra
             "static_check_ok": False,
             "static_error": "format_error",
             "static_warnings": [],
+            "duplicate_kernel": False,
+            "kernel_fingerprint": kernel_fp,
             "eval": _make_failed_eval(False, "Could not extract valid kernel code block", len(kernel)),
         }
+
+    if hasattr(args, "_seen_kernel_fingerprints") and kernel_fp in args._seen_kernel_fingerprints:
+        attempt = _make_duplicate_attempt(genm, raw_text, parsed, kernel)
+        attempt["kernel_fingerprint"] = kernel_fp
+        return attempt
 
     eval_result = asyncio.run(
         evaluate_kernel_async(
@@ -265,6 +307,8 @@ def _evaluate_generated_response(args: argparse.Namespace, ref_arch_src: str, ra
         "kernel": kernel,
         "static_check_ok": None,
         "static_warnings": [],
+        "duplicate_kernel": False,
+        "kernel_fingerprint": kernel_fp,
         "eval": eval_result,
     }
 
@@ -285,9 +329,13 @@ def _run_beam_trajectory(
     best_kernel = None
     best_speedup = 0.0
     best_score = 0.0
+    local_seen_fingerprints: set[str] = set()
 
     for h in local_history:
         ev = h.get("eval", {})
+        fp = h.get("kernel_fingerprint")
+        if fp:
+            local_seen_fingerprints.add(fp)
         if ev.get("correctness"):
             s = float(ev.get("speedup_vs_ref", 0.0))
             score = _kevin_score(ev)
@@ -298,6 +346,7 @@ def _run_beam_trajectory(
                 best_score = score
 
     for step_idx in range(steps):
+        args._seen_kernel_fingerprints = local_seen_fingerprints
         if local_history:
             prompt = _build_refinement_prompt(
                 base_prompt=base_prompt,
@@ -319,6 +368,9 @@ def _run_beam_trajectory(
             }
         )
         attempts.append(attempt)
+        fp = attempt.get("kernel_fingerprint")
+        if fp:
+            local_seen_fingerprints.add(fp)
 
         carry_summary = attempt.get("summary")
         if not carry_summary:
@@ -329,6 +381,7 @@ def _run_beam_trajectory(
                 "kernel": attempt.get("kernel", ""),
                 "summary": _truncate_summary(carry_summary),
                 "eval": attempt.get("eval", {}),
+                "kernel_fingerprint": fp,
             }
         )
 
@@ -391,7 +444,9 @@ def run(args: argparse.Namespace) -> dict:
 
     elif args.technique == "serial_refine":
         history: list[dict] = []
+        seen_fingerprints: set[str] = set()
         for turn_idx in range(args.turns):
+            args._seen_kernel_fingerprints = seen_fingerprints
             if history:
                 prompt = _build_refinement_prompt(
                     base_prompt=base_prompt,
@@ -405,6 +460,9 @@ def run(args: argparse.Namespace) -> dict:
             raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
             attempt = _evaluate_generated_response(args, ref_arch_src, raw, genm)
             attempts.append(attempt)
+            fp = attempt.get("kernel_fingerprint")
+            if fp:
+                seen_fingerprints.add(fp)
 
             carry_summary = attempt.get("summary")
             if not carry_summary:
@@ -415,6 +473,7 @@ def run(args: argparse.Namespace) -> dict:
                     "kernel": attempt.get("kernel", ""),
                     "summary": _truncate_summary(carry_summary),
                     "eval": attempt.get("eval", {}),
+                    "kernel_fingerprint": fp,
                 }
             )
 
