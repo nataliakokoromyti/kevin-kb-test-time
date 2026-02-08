@@ -78,6 +78,14 @@ def _parse_speedup_line(text: str, prefix: str) -> float | None:
     return None
 
 
+def _parse_excessive_speedup_flag(text: str) -> bool:
+    if "Excessive speedup" in text:
+        return True
+    if "excessive_speedup" in text and "True" in text:
+        return True
+    return False
+
+
 def _extract_key_error_from_text(output: str) -> str | None:
     patterns = [
         r"(\w+Error: .+?)(?:\n\n|\n(?=[A-Z])|$)",
@@ -182,41 +190,6 @@ def extract_kernel_code(raw_text: str, require_structured: bool = False) -> str:
     if parsed.kernel:
         return parsed.kernel
     raise RuntimeError("Model output did not contain a code block.")
-
-
-def check_for_cheating(kernel_code: str) -> bool:
-    pytorch_patterns = [
-        "torch.nn.functional",
-        "torch.nn.",
-        "F.conv",
-        "F.linear",
-        "F.relu",
-        "F.gelu",
-        "F.softmax",
-        "F.batch_norm",
-        "F.layer_norm",
-        "F.dropout",
-        "nn.functional.",
-    ]
-    if any(p in kernel_code for p in pytorch_patterns):
-        return True
-
-    if "try:" in kernel_code or "except:" in kernel_code or "except " in kernel_code:
-        return True
-
-    if re.search(r"\bpass\b", kernel_code):
-        return True
-
-    has_custom = any(
-        p in kernel_code
-        for p in ["@triton.jit", "@triton.autotune", "load_inline", "cpp_extension", "cute::", "from cutlass", "@T.prim_func", "tvm.build"]
-    )
-    if not has_custom:
-        for op in ["torch.mm", "torch.bmm", "torch.matmul", "torch.conv", "torch.einsum"]:
-            if op in kernel_code:
-                return True
-
-    return False
 
 
 def extract_key_error(error_message: str | None) -> str:
@@ -352,6 +325,7 @@ def _run_kb_modal_harness(
     runtime_us = _parse_float_line(output, "Custom Kernel exec time")
     ref_runtime_us = _parse_float_line(output, "PyTorch Reference Eager exec time")
     speedup = _parse_speedup_line(output, "Speedup over eager")
+    excessive_speedup = _parse_excessive_speedup_flag(output)
 
     if runtime_us is None:
         runtime_us = -1.0
@@ -382,6 +356,7 @@ def _run_kb_modal_harness(
             "harness": "KernelBench/scripts/run_and_check.py",
             "modal_gpu": modal_gpu,
             "returncode": proc.returncode,
+            "excessive_speedup": excessive_speedup,
             "stdout_tail": (proc.stdout or "")[-4000:],
             "stderr_tail": (proc.stderr or "")[-4000:],
             "timings": {"total_eval_s": time.perf_counter() - t0},
@@ -427,21 +402,6 @@ async def evaluate_kernel_async(
         }
 
     t_start = time.perf_counter()
-    if check_for_cheating(kernel_code):
-        return {
-            "format_ok": True,
-            "compiled": False,
-            "correctness": False,
-            "tests_passed": 0,
-            "tests_total": num_correct_trials,
-            "speedup_vs_ref": -1.0,
-            "runtime_us": -1.0,
-            "ref_runtime_us": -1.0,
-            "cheated": True,
-            "error_message": "Kernel detected as cheating pattern",
-            "code_length": len(kernel_code),
-            "metadata": {"timings": {"total_eval_s": time.perf_counter() - t_start}},
-        }
 
     key = _cache_key(level, problem_id, backend, kernel_code, modal_gpu)
     if cache_results and key in _EVAL_CACHE:

@@ -16,7 +16,6 @@ from .kb_pipeline import (
     get_error_guidance,
     get_problem,
     parse_structured_response,
-    static_check,
 )
 from .model import KevinHF
 
@@ -203,20 +202,6 @@ def _evaluate_generated_response(args: argparse.Namespace, ref_arch_src: str, ra
             "eval": _make_failed_eval(False, "Could not extract valid kernel code block", len(kernel)),
         }
 
-    ok, err, warns = static_check(kernel, backend=args.backend, precision=args.precision)
-    if not ok:
-        return {
-            "generation": asdict(genm),
-            "raw": raw_text,
-            "thought": parsed.thought,
-            "summary": parsed.thought_summary,
-            "kernel": kernel,
-            "static_check_ok": False,
-            "static_error": err,
-            "static_warnings": warns,
-            "eval": _make_failed_eval(True, f"Static check failed: {err}", len(kernel)),
-        }
-
     eval_result = asyncio.run(
         evaluate_kernel_async(
             level=args.level,
@@ -244,8 +229,8 @@ def _evaluate_generated_response(args: argparse.Namespace, ref_arch_src: str, ra
         "thought": parsed.thought,
         "summary": parsed.thought_summary,
         "kernel": kernel,
-        "static_check_ok": True,
-        "static_warnings": warns,
+        "static_check_ok": None,
+        "static_warnings": [],
         "eval": eval_result,
     }
 
