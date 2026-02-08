@@ -150,6 +150,21 @@ def parse_structured_response(text: str) -> ParsedResponse:
     if not kernel:
         kernel = extract_first_code(text, ["python", "cpp"]) or ""
 
+    # Fallback summary extraction for Kevin/QwQ-native format:
+    # if no <SUMMARY> tag is present, use plain text after the code block.
+    if not thought_summary:
+        text_wo_think = THINKING_PATTERN.sub("", raw).strip()
+        code_fence_pattern = re.compile(
+            r"```(?:cuda|python|cpp)?\s*\n.*?```",
+            re.DOTALL | re.IGNORECASE,
+        )
+        stripped = code_fence_pattern.sub("", text_wo_think).strip()
+        # Remove legacy explicit tags if present.
+        stripped = KERNEL_BLOCK_PATTERN.sub("", stripped).strip()
+        stripped = KERNEL_BLOCK_SIMPLE_PATTERN.sub("", stripped).strip()
+        stripped = SUMMARY_BLOCK_PATTERN.sub("", stripped).strip()
+        thought_summary = stripped
+
     format_ok = bool(kernel) and ("class ModelNew" in kernel or "def forward" in kernel)
     return ParsedResponse(
         thought=thought,
@@ -163,7 +178,7 @@ def parse_structured_response(text: str) -> ParsedResponse:
 def extract_kernel_code(raw_text: str, require_structured: bool = False) -> str:
     parsed = parse_structured_response(raw_text)
     if require_structured and not parsed.format_ok:
-        raise RuntimeError("Model output did not match <KERNEL> structured format or valid kernel code.")
+        raise RuntimeError("Model output did not contain valid kernel code.")
     if parsed.kernel:
         return parsed.kernel
     raise RuntimeError("Model output did not contain a code block.")
@@ -229,7 +244,7 @@ def categorize_error(eval_result: dict[str, Any]) -> str:
 
 def get_error_guidance(error_category: str, backend: str) -> str:
     guidance = {
-        "format_error": "Ensure your output is valid `ModelNew` code in <KERNEL>...</KERNEL>.",
+        "format_error": "Ensure your output includes a valid Python code block with `ModelNew`.",
         "compilation_error": f"Fix {backend.upper()} syntax/API issues and imports.",
         "runtime_error": "Fix runtime issues: shape mismatches, bad indexing, invalid launch config.",
         "correctness_error": "Kernel runs but output is wrong. Revisit algorithm and boundary handling.",

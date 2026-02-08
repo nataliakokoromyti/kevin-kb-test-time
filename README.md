@@ -7,7 +7,7 @@ This repo avoids re-implementing KernelBench internals and uses KB directly for:
 - static reward-hacking checks (`kernelbench.kernel_static_checker`)
 - correctness + timing eval (`kernelbench.eval`)
 - dataset loading from Hugging Face (`ScalingIntelligence/KernelBench`)
-- structured multi-turn parsing (`<think>`, `<KERNEL>`, `<SUMMARY>`)
+- Kevin/QwQ-native multi-turn parsing (`<think>` optional, Python code block + plain summary)
 - async eval with timeout + duplicate-kernel cache
 - Modal-only evaluation path (KB script-style)
 
@@ -45,15 +45,15 @@ kevin-kb-run --level 1 --problem-id 1 --technique beam_search --num-beams 16 --b
 
 Results are written to `results/*.json`.
 
-## Structured Output Contract
+## Output Contract
 
-For multi-turn refinement and beam search, the runner instructs the model to emit:
+For multi-turn refinement and beam search, the runner expects:
 
-- `<think>...</think>` (optional; enabled with `--include-think`)
-- `<KERNEL>```python ... ```</KERNEL>` (required)
-- `<SUMMARY>...</SUMMARY>` (used as compressed carry-over between turns)
+- Optional natural `<think>...</think>` reasoning
+- A Python code block with full `ModelNew`
+- A short plain-text summary after the code block
 
-The next-turn prompt carries summary + categorized evaluator feedback (format/compile/runtime/correctness/perf), not raw CoT.
+The next-turn prompt carries summary + categorized evaluator feedback (format/compile/runtime/correctness/perf), not raw CoT. No custom wrapper tags are required.
 
 ## Eval Controls
 

@@ -26,31 +26,21 @@ MAX_SUMMARY_CHARS = 800
 
 STRUCTURED_SYSTEM_WITH_THINK = """You are an expert GPU kernel developer. Optimize the given PyTorch reference with a custom {backend} kernel.
 
-You MUST respond in exactly this format:
-<think>
-1-5 short bullets about your plan and fixes.
-</think>
-<KERNEL>
-```python
-# complete ModelNew implementation
-```
-</KERNEL>
-<SUMMARY>
-2-4 concise sentences for the next refinement turn.
-</SUMMARY>
+Return:
+1. A complete Python code block containing `ModelNew`.
+2. A short plain-text summary (2-4 sentences) of key changes and next fixes.
+
+You may think step-by-step naturally before the final answer.
+Do not use custom wrapper tags like <KERNEL> or <SUMMARY>.
 """
 
 STRUCTURED_SYSTEM_NO_THINK = """You are an expert GPU kernel developer. Optimize the given PyTorch reference with a custom {backend} kernel.
 
-You MUST respond in exactly this format:
-<KERNEL>
-```python
-# complete ModelNew implementation
-```
-</KERNEL>
-<SUMMARY>
-2-4 concise sentences for the next refinement turn.
-</SUMMARY>
+Return:
+1. A complete Python code block containing `ModelNew`.
+2. A short plain-text summary (2-4 sentences) of key changes and next fixes.
+
+Do not use custom wrapper tags like <KERNEL> or <SUMMARY>.
 """
 
 REFINEMENT_TEMPLATE = """
@@ -194,7 +184,7 @@ def _evaluate_generated_response(args: argparse.Namespace, ref_arch_src: str, ra
             "static_check_ok": False,
             "static_error": "format_error",
             "static_warnings": [],
-            "eval": _make_failed_eval(False, "Could not extract valid <KERNEL> response", len(kernel)),
+            "eval": _make_failed_eval(False, "Could not extract valid kernel code block", len(kernel)),
         }
 
     ok, err, warns = static_check(kernel, backend=args.backend, precision=args.precision)
@@ -499,7 +489,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--backend", default="cuda")
     p.add_argument("--prompt-option", default="one_shot", choices=["zero_shot", "one_shot", "few_shot"])
     p.add_argument("--max-new-tokens", type=int, default=16384)
-    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--temperature", type=float, default=0.9)
     p.add_argument("--include-think", action="store_true", default=False)
     p.add_argument("--eval-timeout-s", type=float, default=120.0)
     p.add_argument("--cache-results", action="store_true", default=True)
