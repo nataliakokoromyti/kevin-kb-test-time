@@ -121,6 +121,25 @@ def _kevin_score(eval_result: dict) -> float:
     return KEVIN_CORRECTNESS_BONUS + speedup
 
 
+def _beam_temperatures(
+    count: int,
+    base: float,
+    jitter: float,
+    min_temp: float,
+    max_temp: float,
+) -> list[float]:
+    """Create a deterministic spread of temperatures for beam diversity."""
+    if count <= 1 or jitter <= 0:
+        return [max(min(base, max_temp), min_temp)] * max(count, 1)
+    temps: list[float] = []
+    for i in range(count):
+        frac = -1.0 + 2.0 * i / (count - 1)
+        t = base + frac * jitter
+        t = max(min(t, max_temp), min_temp)
+        temps.append(t)
+    return temps
+
+
 def _build_initial_prompt(base_prompt: str, backend: str, include_think: bool) -> str:
     system = STRUCTURED_SYSTEM_WITH_THINK if include_think else STRUCTURED_SYSTEM_NO_THINK
     return system.format(backend=backend.upper()) + "\n\n" + base_prompt
@@ -254,6 +273,7 @@ def _run_beam_trajectory(
     steps: int,
     round_idx: int,
     trajectory_id: int,
+    generation_temperature: float,
     attempts: list[dict],
 ) -> dict:
     local_history = copy.deepcopy(history)
@@ -283,13 +303,14 @@ def _run_beam_trajectory(
         else:
             prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
 
-        raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=args.beam_temperature)
+        raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=generation_temperature)
         attempt = _evaluate_generated_response(args, ref_arch_src, raw, genm)
         attempt.update(
             {
                 "round": round_idx,
                 "trajectory_id": trajectory_id,
                 "trajectory_step": step_idx + 1,
+                "generation_temperature": generation_temperature,
             }
         )
         attempts.append(attempt)
@@ -404,6 +425,13 @@ def run(args: argparse.Namespace) -> dict:
             raise ValueError("num_beams must be divisible by beam_width")
 
         trajectories = []
+        round1_temps = _beam_temperatures(
+            count=args.num_beams,
+            base=args.beam_temperature,
+            jitter=args.beam_temp_jitter,
+            min_temp=args.beam_min_temperature,
+            max_temp=args.beam_max_temperature,
+        )
         for beam_idx in range(args.num_beams):
             trajectories.append(
                 _run_beam_trajectory(
@@ -415,6 +443,7 @@ def run(args: argparse.Namespace) -> dict:
                     steps=args.steps_per_round,
                     round_idx=1,
                     trajectory_id=beam_idx,
+                    generation_temperature=round1_temps[beam_idx],
                     attempts=attempts,
                 )
             )
@@ -425,8 +454,21 @@ def run(args: argparse.Namespace) -> dict:
             expanded = []
             clones_per_survivor = args.num_beams // args.beam_width
             trajectory_id = 0
-            for survivor in survivors:
-                for _ in range(clones_per_survivor):
+            for survivor_rank, survivor in enumerate(survivors):
+                clone_temps = _beam_temperatures(
+                    count=clones_per_survivor,
+                    base=args.beam_temperature,
+                    jitter=args.beam_temp_jitter,
+                    min_temp=args.beam_min_temperature,
+                    max_temp=args.beam_max_temperature,
+                )
+                # Slight rank-conditioned offset: top survivors get slightly more exploitative temps.
+                rank_offset = min(0.05 * survivor_rank, 0.15)
+                for clone_idx in range(clones_per_survivor):
+                    t = max(
+                        min(clone_temps[clone_idx] - rank_offset, args.beam_max_temperature),
+                        args.beam_min_temperature,
+                    )
                     expanded.append(
                         _run_beam_trajectory(
                             args=args,
@@ -437,6 +479,7 @@ def run(args: argparse.Namespace) -> dict:
                             steps=args.steps_per_round,
                             round_idx=round_idx,
                             trajectory_id=trajectory_id,
+                            generation_temperature=t,
                             attempts=attempts,
                         )
                     )
@@ -477,6 +520,9 @@ def run(args: argparse.Namespace) -> dict:
             "steps_per_round": args.steps_per_round,
             "num_rounds": args.num_rounds,
             "beam_temperature": args.beam_temperature,
+            "beam_temp_jitter": args.beam_temp_jitter,
+            "beam_min_temperature": args.beam_min_temperature,
+            "beam_max_temperature": args.beam_max_temperature,
             "include_think": args.include_think,
             "eval_timeout_s": args.eval_timeout_s,
             "cache_results": args.cache_results,
@@ -514,6 +560,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps-per-round", type=int, default=4)
     p.add_argument("--num-rounds", type=int, default=2)
     p.add_argument("--beam-temperature", type=float, default=0.9)
+    p.add_argument("--beam-temp-jitter", type=float, default=0.2)
+    p.add_argument("--beam-min-temperature", type=float, default=0.6)
+    p.add_argument("--beam-max-temperature", type=float, default=1.2)
     p.add_argument("--level", type=int, default=1)
     p.add_argument("--problem-id", type=int, required=True)
     p.add_argument("--dataset-source", default="huggingface", choices=["local", "huggingface"])
