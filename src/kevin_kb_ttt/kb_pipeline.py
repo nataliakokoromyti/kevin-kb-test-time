@@ -166,12 +166,19 @@ def parse_structured_response(text: str) -> ParsedResponse:
             r"```(?:cuda|python|cpp)?\s*\n.*?```",
             re.DOTALL | re.IGNORECASE,
         )
-        stripped = code_fence_pattern.sub("", text_wo_think).strip()
-        # Remove legacy explicit tags if present.
-        stripped = KERNEL_BLOCK_PATTERN.sub("", stripped).strip()
-        stripped = KERNEL_BLOCK_SIMPLE_PATTERN.sub("", stripped).strip()
-        stripped = SUMMARY_BLOCK_PATTERN.sub("", stripped).strip()
-        thought_summary = stripped
+        fences = list(code_fence_pattern.finditer(text_wo_think))
+        if fences:
+            # Use only trailing text after the last code block to avoid pulling in preambles.
+            trailing = text_wo_think[fences[-1].end() :].strip()
+            trailing = SUMMARY_BLOCK_PATTERN.sub("", trailing).strip()
+            thought_summary = trailing
+        else:
+            # Fallback when no explicit code fence exists.
+            stripped = text_wo_think
+            stripped = KERNEL_BLOCK_PATTERN.sub("", stripped).strip()
+            stripped = KERNEL_BLOCK_SIMPLE_PATTERN.sub("", stripped).strip()
+            stripped = SUMMARY_BLOCK_PATTERN.sub("", stripped).strip()
+            thought_summary = stripped
 
     format_ok = bool(kernel) and ("class ModelNew" in kernel or "def forward" in kernel)
     return ParsedResponse(
