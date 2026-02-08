@@ -79,6 +79,12 @@ class KevinModalOpenAI:
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Invalid JSON from Modal LLM endpoint: {raw[:800]}") from e
 
+    @staticmethod
+    def _to_messages(prompt: PromptInput) -> list[ChatMessage]:
+        if isinstance(prompt, str):
+            return [{"role": "user", "content": prompt}]
+        return prompt
+
     def generate(self, prompt: PromptInput, max_new_tokens: int = 16384, temperature: float = 0.9) -> tuple[str, GenMetrics]:
         payload = {
             "model": self.model_id,
@@ -154,8 +160,3 @@ def create_model(
         timeout_s=modal_llm_timeout_s,
         max_parallel_requests=modal_llm_max_parallel_requests,
     )
-    @staticmethod
-    def _to_messages(prompt: PromptInput) -> list[ChatMessage]:
-        if isinstance(prompt, str):
-            return [{"role": "user", "content": prompt}]
-        return prompt
