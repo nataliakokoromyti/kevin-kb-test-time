@@ -21,6 +21,7 @@ from .model import create_model
 
 MAX_KERNEL_HISTORY_LEN = 2000
 MAX_SUMMARY_CHARS = 800
+KEVIN_CORRECTNESS_BONUS = 0.3
 
 
 STRUCTURED_SYSTEM_WITH_THINK = """You are an expert GPU kernel developer. Optimize the given PyTorch reference with a custom {backend} kernel.
@@ -109,6 +110,15 @@ def _error_category_display(error_category: str) -> str:
         "success": "SUCCESS",
     }
     return labels.get(error_category, error_category.upper())
+
+
+def _kevin_score(eval_result: dict) -> float:
+    """Kevin-style step score: S = 0.3 * correct + speedup * correct."""
+    correct = bool(eval_result.get("correctness", False))
+    if not correct:
+        return 0.0
+    speedup = float(eval_result.get("speedup_vs_ref", 0.0))
+    return KEVIN_CORRECTNESS_BONUS + speedup
 
 
 def _build_initial_prompt(base_prompt: str, backend: str, include_think: bool) -> str:
@@ -249,14 +259,18 @@ def _run_beam_trajectory(
     local_history = copy.deepcopy(history)
     best_kernel = None
     best_speedup = 0.0
+    best_score = 0.0
 
     for h in local_history:
         ev = h.get("eval", {})
         if ev.get("correctness"):
             s = float(ev.get("speedup_vs_ref", 0.0))
+            score = _kevin_score(ev)
             if s > best_speedup:
                 best_speedup = s
                 best_kernel = h.get("kernel")
+            if score > best_score:
+                best_score = score
 
     for step_idx in range(steps):
         if local_history:
@@ -295,13 +309,17 @@ def _run_beam_trajectory(
         ev = attempt.get("eval", {})
         if ev.get("correctness"):
             s = float(ev.get("speedup_vs_ref", 0.0))
+            score = _kevin_score(ev)
             if s > best_speedup:
                 best_speedup = s
                 best_kernel = attempt.get("kernel")
+            if score > best_score:
+                best_score = score
 
     return {
         "best_kernel": best_kernel,
         "best_speedup": best_speedup,
+        "best_score": best_score,
         "history": local_history,
     }
 
@@ -402,7 +420,7 @@ def run(args: argparse.Namespace) -> dict:
             )
 
         for round_idx in range(2, args.num_rounds + 1):
-            trajectories.sort(key=lambda t: t["best_speedup"], reverse=True)
+            trajectories.sort(key=lambda t: t["best_score"], reverse=True)
             survivors = trajectories[: args.beam_width]
             expanded = []
             clones_per_survivor = args.num_beams // args.beam_width
