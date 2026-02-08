@@ -747,8 +747,9 @@ async def run_async(args: argparse.Namespace) -> dict:
                 )
                 rank_offset = min(0.05 * survivor_rank, 0.15)
                 for clone_idx in range(clones_per_survivor):
+                    # Make lower-ranked survivors more exploratory (hotter) than top survivors.
                     t = max(
-                        min(clone_temps[clone_idx] - rank_offset, args.beam_max_temperature),
+                        min(clone_temps[clone_idx] + rank_offset, args.beam_max_temperature),
                         args.beam_min_temperature,
                     )
                     expanded.append(
