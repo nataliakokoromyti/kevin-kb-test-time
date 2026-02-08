@@ -322,7 +322,7 @@ async def _evaluate_kernels_batch_async(args: argparse.Namespace, ref_arch_src: 
     return await asyncio.gather(*coros)
 
 
-def _evaluate_generated_response(
+async def _evaluate_generated_response_async(
     args: argparse.Namespace,
     ref_arch_src: str,
     raw_text: str,
@@ -332,7 +332,7 @@ def _evaluate_generated_response(
     attempt, kernel_for_eval = _prepare_generated_attempt(args, raw_text, genm, seen_kernel_fingerprints)
     if kernel_for_eval is None:
         return attempt
-    attempt["eval"] = asyncio.run(_evaluate_kernels_batch_async(args, ref_arch_src, [kernel_for_eval]))[0]
+    attempt["eval"] = (await _evaluate_kernels_batch_async(args, ref_arch_src, [kernel_for_eval]))[0]
     return attempt
 
 
@@ -442,7 +442,7 @@ def _write_intermediate_result(args: argparse.Namespace, run_id: str, label: str
     return checkpoint_path
 
 
-def run(args: argparse.Namespace) -> dict:
+async def run_async(args: argparse.Namespace) -> dict:
     problem_name, ref_arch_src = get_problem(
         level=args.level,
         problem_id=args.problem_id,
@@ -510,7 +510,7 @@ def run(args: argparse.Namespace) -> dict:
     if args.technique == "greedy":
         prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
         raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
-        attempt = _evaluate_generated_response(args, ref_arch_src, raw, genm, set())
+        attempt = await _evaluate_generated_response_async(args, ref_arch_src, raw, genm, set())
         attempt["attempt_id"] = next_attempt_id
         next_attempt_id += 1
         attempt["parent_attempt_id"] = None
@@ -541,7 +541,7 @@ def run(args: argparse.Namespace) -> dict:
                 seen_fingerprints.add(fp)
 
         if eval_kernels:
-            eval_results = asyncio.run(_evaluate_kernels_batch_async(args, ref_arch_src, eval_kernels))
+            eval_results = await _evaluate_kernels_batch_async(args, ref_arch_src, eval_kernels)
             for pending_idx, eval_result in zip(eval_indices, eval_results):
                 pending_attempts[pending_idx]["eval"] = eval_result
 
@@ -563,7 +563,7 @@ def run(args: argparse.Namespace) -> dict:
                 prompt = _build_initial_prompt(base_prompt, args.backend, args.include_think)
 
             raw, genm = llm.generate(prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
-            attempt = _evaluate_generated_response(args, ref_arch_src, raw, genm, seen_fingerprints)
+            attempt = await _evaluate_generated_response_async(args, ref_arch_src, raw, genm, seen_fingerprints)
             attempt["attempt_id"] = next_attempt_id
             next_attempt_id += 1
             attempt["parent_attempt_id"] = parent_attempt_id
@@ -665,7 +665,7 @@ def run(args: argparse.Namespace) -> dict:
                         eval_kernels.append(kernel_for_eval)
 
                 if eval_kernels:
-                    eval_results = asyncio.run(_evaluate_kernels_batch_async(args, ref_arch_src, eval_kernels))
+                    eval_results = await _evaluate_kernels_batch_async(args, ref_arch_src, eval_kernels)
                     for pending_idx, eval_result in zip(eval_indices, eval_results):
                         pending_attempts[pending_idx]["attempt"]["eval"] = eval_result
 
@@ -795,6 +795,10 @@ def run(args: argparse.Namespace) -> dict:
         attempts=attempts,
         settings=settings,
     )
+
+
+def run(args: argparse.Namespace) -> dict:
+    return asyncio.run(run_async(args))
 
 
 def parse_args() -> argparse.Namespace:
