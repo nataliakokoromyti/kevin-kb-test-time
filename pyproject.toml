@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kevin-kb-test-time"
+version = "0.1.0"
+description = "Test-time techniques for Kevin-32B using KernelBench package APIs"
+readme = "README.md"
+requires-python = "==3.10.*"
+dependencies = [
+  "torch>=2.3",
+  "transformers>=4.45",
+  "accelerate>=0.34",
+  "kernelbench @ git+https://github.com/ScalingIntelligence/KernelBench.git",
+]
+
+[project.scripts]
+kevin-kb-run = "kevin_kb_ttt.runner:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

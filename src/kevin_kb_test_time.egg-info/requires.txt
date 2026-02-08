@@ -1,0 +1,4 @@
+torch>=2.3
+transformers>=4.45
+accelerate>=0.34
+kernelbench @ git+https://github.com/ScalingIntelligence/KernelBench.git

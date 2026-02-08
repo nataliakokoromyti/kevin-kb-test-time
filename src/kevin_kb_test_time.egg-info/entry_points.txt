@@ -1,0 +1,2 @@
+[console_scripts]
+kevin-kb-run = kevin_kb_ttt.runner:main
