@@ -373,6 +373,17 @@ def _apply_attempt_to_history(history: list[dict], attempt: dict) -> None:
     )
 
 
+def _ensure_attempt_eval(attempt: dict) -> None:
+    if "eval" in attempt:
+        return
+    kernel = attempt.get("kernel", "") or ""
+    attempt["eval"] = _make_failed_eval(
+        True,
+        "Internal pipeline error: missing eval payload for attempt.",
+        len(kernel),
+    )
+
+
 def _parent_attempt_id_from_history(history: list[dict]) -> int | None:
     if not history:
         return None
@@ -566,6 +577,8 @@ async def run_async(args: argparse.Namespace) -> dict:
             for pending_idx, eval_result in zip(eval_indices, eval_results):
                 pending_attempts[pending_idx]["eval"] = eval_result
 
+        for attempt in pending_attempts:
+            _ensure_attempt_eval(attempt)
         attempts.extend(pending_attempts)
 
     elif args.technique == "serial_refine":
@@ -693,6 +706,7 @@ async def run_async(args: argparse.Namespace) -> dict:
                 for item in pending_attempts:
                     traj = item["trajectory"]
                     attempt = item["attempt"]
+                    _ensure_attempt_eval(attempt)
                     attempts.append(attempt)
 
                     fp = attempt.get("kernel_fingerprint")
